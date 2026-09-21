@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.24)
-project(tiled_sgemm LANGUAGES CXX CUDA)
 
 # ---------------------------------------------------------------------------
 # Architectures
@@ -10,9 +9,14 @@ project(tiled_sgemm LANGUAGES CXX CUDA)
 #   but ptxas scheduled it for Ampere's pipeline, so dev numbers on Ada would be
 #   quietly pessimistic. Build for the card you measure on.
 # ---------------------------------------------------------------------------
+#   Must be set BEFORE project(): enabling CUDA otherwise fills in CMake's own
+#   default (sm_52), and a later NOT DEFINED check never fires.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 80 86)
+  set(CMAKE_CUDA_ARCHITECTURES "80;86" CACHE STRING "CUDA SM targets")
 endif()
+
+project(tiled_sgemm LANGUAGES CXX CUDA)
+
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)

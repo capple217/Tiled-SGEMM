@@ -1,0 +1,389 @@
+// Benchmark driver.
+//
+//   sgemm_bench [--kernel all|cublas|NAME[,NAME...]] [--sizes PRESET|LIST]
+//               [--warmup 10] [--iters 50] [--alpha 1] [--beta 0]
+//               [--sm-clock-mhz MHZ] [--csv PATH] [--no-flush-l2]
+//               [--no-verify] [--cublas-math default|pedantic] [--profile]
+//
+//   PRESET: quick | square | rect | odd | all.  LIST: 4096,1000x1500x2003,...
+//
+// Methodology (each choice is here because it changes the numbers):
+//  * cuBLAS runs first at every size and is the "% of cuBLAS" denominator,
+//    under the exact same timing protocol as our kernels.
+//  * Every kernel is VERIFIED against cuBLAS at that size before it is timed.
+//    A wrong kernel gets verified=0 in the CSV. Its speed is meaningless.
+//  * Each iteration is timed individually with a CUDA event pair, so we get a
+//    distribution rather than one averaged number. GFLOPS uses the median.
+//  * L2 is flushed (a memset over 2x L2 capacity) BEFORE each timed iteration,
+//    outside the event pair. Without it, at sizes where A+B fit in L2 (A100:
+//    40 MB, i.e. <= ~2048^2 for A and B together), iteration i+1 finds its
+//    operands L2-resident from iteration i and memory-bound kernels look better
+//    than they would inside a real workload. --no-flush-l2 turns it off, e.g.
+//    to reproduce published numbers that didn't flush.
+//  * At small sizes (<= 512) kernel time is ~microseconds: event resolution
+//    (~0.5 us) and launch latency are a real fraction of it. Treat those rows
+//    as latency measurements, not throughput.
+//  * --profile: run each selected kernel ONCE per size (no warmup, no cuBLAS
+//    baseline, no verify) so Nsight Compute captures exactly one launch.
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "sgemm/check.hpp"
+#include "sgemm/common.hpp"
+#include "sgemm/cublas_ref.hpp"
+#include "sgemm/device_info.hpp"
+#include "sgemm/host_utils.hpp"
+#include "sgemm/kernels.hpp"
+
+using namespace sgemm;
+
+namespace {
+
+struct Shape { int M, N, K; };
+
+struct Options {
+  std::string kernels = "all";
+  std::string sizes = "square";
+  int warmup = 10;
+  int iters = 50;
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  int sm_clock_mhz = 0;
+  std::string csv;
+  bool flush_l2 = true;
+  bool verify = true;
+  bool profile = false;
+  CublasMath math = CublasMath::Default;
+};
+
+[[noreturn]] void usage(const char* msg) {
+  std::fprintf(stderr, "error: %s\n(see header of bench/bench.cu for usage)\n", msg);
+  std::exit(2);
+}
+
+std::vector<std::string> split(const std::string& s, char d) {
+  std::vector<std::string> out;
+  std::stringstream ss(s);
+  std::string t;
+  while (std::getline(ss, t, d))
+    if (!t.empty()) out.push_back(t);
+  return out;
+}
+
+std::vector<Shape> parse_sizes(const std::string& spec) {
+  // square: the headline sweep. rect: skinny/fat and short/long-K shapes, which
+  // stress different things (short K: prologue/epilogue dominate; long K: the
+  // main loop). odd: non-multiples of every tile size we'll use, i.e. the
+  // boundary-handling cases, benchmarked as well as tested.
+  const std::vector<Shape> square = {{256, 256, 256},    {512, 512, 512},
+                                     {1024, 1024, 1024}, {2048, 2048, 2048},
+                                     {3072, 3072, 3072}, {4096, 4096, 4096},
+                                     {6144, 6144, 6144}, {8192, 8192, 8192}};
+  const std::vector<Shape> rect = {{8192, 1024, 1024}, {1024, 8192, 1024},
+                                   {4096, 4096, 512},  {1024, 1024, 8192},
+                                   {4096, 11008, 4096}};
+  const std::vector<Shape> odd = {{1000, 1000, 1000}, {2047, 2047, 2047},
+                                  {3001, 3001, 3001}, {4097, 4093, 4099}};
+  const std::vector<Shape> quick = {{1024, 1024, 1024}, {2048, 2048, 2048},
+                                    {4096, 4096, 4096}};
+  if (spec == "square") return square;
+  if (spec == "rect") return rect;
+  if (spec == "odd") return odd;
+  if (spec == "quick") return quick;
+  if (spec == "all") {
+    std::vector<Shape> v = square;
+    v.insert(v.end(), rect.begin(), rect.end());
+    v.insert(v.end(), odd.begin(), odd.end());
+    return v;
+  }
+  std::vector<Shape> v;
+  for (const auto& tok : split(spec, ',')) {
+    const auto p = split(tok, 'x');
+    if (p.size() == 1) {
+      const int n = std::atoi(p[0].c_str());
+      v.push_back({n, n, n});
+    } else if (p.size() == 3) {
+      v.push_back({std::atoi(p[0].c_str()), std::atoi(p[1].c_str()), std::atoi(p[2].c_str())});
+    } else {
+      usage(("bad size: " + tok).c_str());
+    }
+    const Shape& s = v.back();
+    if (!dims_fit_int32(s.M, s.N, s.K)) usage(("size out of range: " + tok).c_str());
+  }
+  return v;
+}
+
+Options parse_args(int argc, char** argv) {
+  Options o;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto next = [&]() -> std::string {
+      if (i + 1 >= argc) usage(("missing value for " + a).c_str());
+      return argv[++i];
+    };
+    if (a == "--kernel") o.kernels = next();
+    else if (a == "--sizes") o.sizes = next();
+    else if (a == "--warmup") o.warmup = std::atoi(next().c_str());
+    else if (a == "--iters") o.iters = std::atoi(next().c_str());
+    else if (a == "--alpha") o.alpha = std::strtof(next().c_str(), nullptr);
+    else if (a == "--beta") o.beta = std::strtof(next().c_str(), nullptr);
+    else if (a == "--sm-clock-mhz") o.sm_clock_mhz = std::atoi(next().c_str());
+    else if (a == "--csv") o.csv = next();
+    else if (a == "--no-flush-l2") o.flush_l2 = false;
+    else if (a == "--no-verify") o.verify = false;
+    else if (a == "--profile") o.profile = true;
+    else if (a == "--cublas-math") {
+      const std::string m = next();
+      if (m == "default") o.math = CublasMath::Default;
+      else if (m == "pedantic") o.math = CublasMath::Pedantic;
+      else usage("--cublas-math must be default|pedantic");
+    } else if (a == "-h" || a == "--help") usage("help requested");
+    else usage(("unknown arg: " + a).c_str());
+  }
+  if (o.iters < 1 || o.warmup < 0) usage("bad --iters/--warmup");
+  return o;
+}
+
+using Run = std::function<void(cudaStream_t)>;
+
+// Returns per-iteration times in ms.
+std::vector<double> time_runs(const Run& run, int warmup, int iters, cudaStream_t s,
+                              void* flush_buf, size_t flush_bytes) {
+  for (int i = 0; i < warmup; ++i) run(s);
+  CUDA_CHECK(cudaStreamSynchronize(s));
+
+  std::vector<cudaEvent_t> start(iters), stop(iters);
+  for (int i = 0; i < iters; ++i) {
+    CUDA_CHECK(cudaEventCreate(&start[i]));
+    CUDA_CHECK(cudaEventCreate(&stop[i]));
+  }
+  for (int i = 0; i < iters; ++i) {
+    // Outside the timed window: evict A/B/C from L2 by streaming writes over
+    // a buffer 2x L2's size. The byte value changes each iteration so no
+    // layer can elide it as redundant.
+    if (flush_buf) CUDA_CHECK(cudaMemsetAsync(flush_buf, i & 0xff, flush_bytes, s));
+    CUDA_CHECK(cudaEventRecord(start[i], s));
+    run(s);
+    CUDA_CHECK(cudaEventRecord(stop[i], s));
+  }
+  CUDA_CHECK(cudaStreamSynchronize(s));
+
+  std::vector<double> ms(iters);
+  for (int i = 0; i < iters; ++i) {
+    float t = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&t, start[i], stop[i]));
+    ms[i] = t;
+    CUDA_CHECK(cudaEventDestroy(start[i]));
+    CUDA_CHECK(cudaEventDestroy(stop[i]));
+  }
+  return ms;
+}
+
+struct Row {
+  std::string kernel;
+  int stage;
+  Shape shape;
+  Stats st;
+  double gflops_median, gflops_best, pct_cublas, pct_peak;
+  int verified;         // 1 pass, 0 fail, -1 not checked
+  double max_err_eps;   // max normalised error in units of FLT_EPSILON
+};
+
+std::string timestamp() {
+  char buf[32];
+  const std::time_t t = std::time(nullptr);
+  std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
+  return buf;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  const Options opt = parse_args(argc, argv);
+  const std::vector<Shape> shapes = parse_sizes(opt.sizes);
+
+  // Resolve kernel selection. "cublas" is selectable (useful for --profile).
+  bool want_cublas_timed = !opt.profile;
+  std::vector<const KernelSpec*> kernels;
+  if (opt.kernels == "all") {
+    for (const auto& k : all_kernels()) kernels.push_back(&k);
+  } else {
+    for (const auto& name : split(opt.kernels, ',')) {
+      if (name == "cublas") { want_cublas_timed = true; continue; }
+      const KernelSpec* k = find_kernel(name);
+      if (!k) usage(("unknown kernel: " + name).c_str());
+      kernels.push_back(k);
+    }
+  }
+
+  const DeviceInfo dev = query_device();
+  CublasSgemm blas(opt.math);
+  const int clock_mhz = opt.sm_clock_mhz > 0 ? opt.sm_clock_mhz : dev.max_sm_clock_mhz;
+  const double peak = dev.peak_fp32_gflops(clock_mhz);
+
+  // ---- metadata: everything needed to reproduce / judge a number ----------
+  std::ostringstream meta;
+  meta << "# timestamp=" << timestamp() << "\n"
+       << "# git_rev=" << SGEMM_GIT_REV << "\n"
+       << "# device=" << dev.name << "\n"
+       << "# compute_capability=" << dev.cc_major << "." << dev.cc_minor << "\n"
+       << "# sm_count=" << dev.sm_count << "\n"
+       << "# fp32_lanes_per_sm=" << dev.fp32_lanes_per_sm << "\n"
+       << "# max_sm_clock_mhz=" << dev.max_sm_clock_mhz << "\n"
+       << "# peak_clock_mhz=" << clock_mhz << "\n"
+       << "# peak_clock_source=" << (opt.sm_clock_mhz > 0 ? "user_locked" : "driver_max_boost") << "\n"
+       << "# peak_fp32_gflops=" << peak << "\n"
+       << "# peak_dram_gbs=" << dev.peak_dram_gbs() << "\n"
+       << "# l2_bytes=" << dev.l2_bytes << "\n"
+       << "# driver_version=" << dev.driver_version << "\n"
+       << "# runtime_version=" << dev.runtime_version << "\n"
+       << "# cublas_version=" << blas.version() << "\n"
+       << "# cublas_math=" << blas.mode_name() << "\n"
+       << "# alpha=" << opt.alpha << "\n"
+       << "# beta=" << opt.beta << "\n"
+       << "# warmup=" << opt.warmup << "\n"
+       << "# iters=" << opt.iters << "\n"
+       << "# flush_l2=" << (opt.flush_l2 ? 1 : 0) << "\n"
+       << "# flops_convention=2MNK\n";
+  std::fputs(meta.str().c_str(), stdout);
+  if (opt.sm_clock_mhz <= 0 && !opt.profile) {
+    std::fprintf(stderr,
+                 "[bench] WARNING: %% of peak uses the driver's max boost clock (%d MHz). "
+                 "For reportable runs lock clocks (scripts/lock_clocks.sh) and pass "
+                 "--sm-clock-mhz.\n", dev.max_sm_clock_mhz);
+  }
+
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+  void* flush_buf = nullptr;
+  const size_t flush_bytes = 2 * static_cast<size_t>(dev.l2_bytes);
+  if (opt.flush_l2 && !opt.profile) CUDA_CHECK(cudaMalloc(&flush_buf, flush_bytes));
+
+  std::vector<Row> rows;
+  std::printf("\n%-10s %6s %6s %6s %10s %9s %8s %9s %8s %7s\n", "kernel", "M", "N", "K",
+              "median_ms", "std_ms", "GFLOPS", "%cuBLAS", "%peak", "check");
+
+  for (size_t si = 0; si < shapes.size(); ++si) {
+    const Shape s = shapes[si];
+    const size_t nA = size_t(s.M) * s.K, nB = size_t(s.K) * s.N, nC = size_t(s.M) * s.N;
+    const double flops = gemm_flops(s.M, s.N, s.K);
+
+    std::vector<float> hA(nA), hB(nB), hC0(nC);
+    fill_uniform(hA.data(), nA, 1000 + 3 * si);
+    fill_uniform(hB.data(), nB, 1001 + 3 * si);
+    fill_uniform(hC0.data(), nC, 1002 + 3 * si);
+
+    float *dA, *dB, *dC, *dC0;
+    CUDA_CHECK(cudaMalloc(&dA, nA * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dB, nB * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dC, nC * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dC0, nC * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(dA, hA.data(), nA * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, hB.data(), nB * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dC0, hC0.data(), nC * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Reset C to its initial state. For beta == 0, fill with NaN (0xFFFFFFFF)
+    // so a kernel that illegally reads C fails verification.
+    auto reset_C = [&]() {
+      if (opt.beta != 0.0f)
+        CUDA_CHECK(cudaMemcpy(dC, dC0, nC * sizeof(float), cudaMemcpyDeviceToDevice));
+      else
+        CUDA_CHECK(cudaMemset(dC, 0xFF, nC * sizeof(float)));
+    };
+
+    Reference ref;
+    const bool do_verify = opt.verify && !opt.profile && !kernels.empty();
+    if (do_verify) ref = gpu_reference(blas, s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, hC0);
+
+    auto emit = [&](const std::string& name, int stage, const Stats& st, double cublas_gf,
+                    int verified, double err_eps) {
+      Row r{name, stage, s, st, flops / (st.median * 1e6), flops / (st.min * 1e6), 0, 0,
+            verified, err_eps};
+      r.pct_cublas = cublas_gf > 0 ? 100.0 * r.gflops_median / cublas_gf : 0.0;
+      r.pct_peak = peak > 0 ? 100.0 * r.gflops_median / peak : 0.0;
+      std::printf("%-10s %6d %6d %6d %10.4f %9.4f %8.1f %8.1f%% %7.1f%% %7s\n",
+                  name.c_str(), s.M, s.N, s.K, st.median, st.stddev, r.gflops_median,
+                  r.pct_cublas, r.pct_peak,
+                  verified == 1 ? "ok" : verified == 0 ? "FAIL" : "-");
+      rows.push_back(r);
+    };
+
+    // ---- cuBLAS baseline ---------------------------------------------------
+    double cublas_gflops = 0.0;
+    if (want_cublas_timed) {
+      reset_C();
+      const Run run = [&](cudaStream_t st) {
+        blas(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, st);
+      };
+      const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
+                                           opt.profile ? 1 : opt.iters, stream,
+                                           flush_buf, flush_bytes));
+      cublas_gflops = flops / (st.median * 1e6);
+      emit("cublas", 0, st, cublas_gflops, -1, 0.0);
+    }
+
+    // ---- our kernels -------------------------------------------------------
+    for (const KernelSpec* k : kernels) {
+      int verified = -1;
+      double err_eps = 0.0;
+      if (do_verify) {
+        reset_C();
+        k->launch(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> got(nC);
+        CUDA_CHECK(cudaMemcpy(got.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost));
+        const CheckResult cr = compare(got.data(), ref.ref.data(), ref.scale.data(), nC, s.K);
+        verified = cr.pass ? 1 : 0;
+        err_eps = cr.max_err / FLT_EPSILON;
+        if (!cr.pass)
+          std::fprintf(stderr, "[bench] %s %dx%dx%d FAILED: %lld bad, worst idx %lld got %g want %g\n",
+                       k->name, s.M, s.N, s.K, cr.num_bad, cr.worst_idx, cr.got_worst, cr.ref_worst);
+      }
+      reset_C();
+      const Run run = [&](cudaStream_t st) {
+        k->launch(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, st);
+      };
+      const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
+                                           opt.profile ? 1 : opt.iters, stream,
+                                           flush_buf, flush_bytes));
+      emit(k->name, k->stage, st, cublas_gflops, verified, err_eps);
+    }
+
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dC));
+    CUDA_CHECK(cudaFree(dC0));
+  }
+
+  if (flush_buf) CUDA_CHECK(cudaFree(flush_buf));
+  CUDA_CHECK(cudaStreamDestroy(stream));
+
+  if (!opt.csv.empty()) {
+    std::ofstream f(opt.csv);
+    if (!f) usage(("cannot open " + opt.csv).c_str());
+    f << meta.str();
+    f << "kernel,stage,M,N,K,ms_median,ms_mean,ms_std,ms_min,ms_max,iters,"
+         "gflops_median,gflops_best,pct_cublas,pct_peak,verified,max_err_eps\n";
+    for (const Row& r : rows) {
+      f << r.kernel << ',' << r.stage << ',' << r.shape.M << ',' << r.shape.N << ','
+        << r.shape.K << ',' << r.st.median << ',' << r.st.mean << ',' << r.st.stddev << ','
+        << r.st.min << ',' << r.st.max << ',' << r.st.n << ',' << r.gflops_median << ','
+        << r.gflops_best << ',' << r.pct_cublas << ',' << r.pct_peak << ',' << r.verified
+        << ',' << r.max_err_eps << '\n';
+    }
+    std::printf("\nwrote %s\n", opt.csv.c_str());
+  }
+
+  // Non-zero exit if any kernel produced wrong results, so scripts notice.
+  for (const Row& r : rows)
+    if (r.verified == 0) return 1;
+  return 0;
+}
