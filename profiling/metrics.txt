@@ -1,0 +1,67 @@
+# Compact metric set captured for EVERY stage (profiling/profile.sh).
+# The full `--set full` report is also saved; this list is the subset that goes
+# into the WRITEUP attribution tables. One metric per line; '#' = comment.
+# scripts/env_check.sh verifies each base name exists on the current GPU/ncu.
+
+# ---- headline -------------------------------------------------------------
+gpu__time_duration.sum
+sm__throughput.avg.pct_of_peak_sustained_elapsed
+gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed
+
+# ---- FMA pipe: is the math unit actually busy? (the thing we maximise) ---
+sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active
+smsp__sass_thread_inst_executed_op_ffma_pred_on.sum
+smsp__inst_executed.sum
+smsp__issue_active.avg.pct_of_peak_sustained_active
+
+# ---- DRAM -----------------------------------------------------------------
+dram__throughput.avg.pct_of_peak_sustained_elapsed
+dram__bytes_read.sum
+dram__bytes_write.sum
+
+# ---- L2 -------------------------------------------------------------------
+lts__t_sectors_op_read.sum
+lts__t_sectors_op_write.sum
+lts__t_sector_hit_rate.pct
+
+# ---- L1 / global coalescing. sectors/request: 4 is ideal for a warp-wide
+# ---- 4B access (128B = 4 x 32B sectors), 32 is fully uncoalesced, 1 is broadcast.
+l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum
+l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum
+l1tex__t_requests_pipe_lsu_mem_global_op_st.sum
+l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum
+l1tex__t_sector_hit_rate.pct
+l1tex__throughput.avg.pct_of_peak_sustained_active
+smsp__inst_executed_op_global_ld.sum
+
+# ---- shared memory: wavefronts per instruction is the bank-conflict signal.
+# ---- 1 wavefront per LDS/STS (32-bit, no conflicts) is ideal.
+smsp__inst_executed_op_shared_ld.sum
+smsp__inst_executed_op_shared_st.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum
+
+# ---- occupancy & resources -----------------------------------------------
+sm__warps_active.avg.pct_of_peak_sustained_active
+launch__registers_per_thread
+launch__shared_mem_per_block_static
+launch__shared_mem_per_block_dynamic
+launch__occupancy_limit_registers
+launch__occupancy_limit_shared_mem
+launch__occupancy_limit_warps
+launch__occupancy_limit_blocks
+
+# ---- warp stall reasons (% of active warp-cycles stalled on each) --------
+smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct
+smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct
+smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct
+smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct
+smsp__warp_issue_stalled_barrier_per_warp_active.pct
+smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct
+smsp__warp_issue_stalled_wait_per_warp_active.pct
+smsp__warp_issue_stalled_not_selected_per_warp_active.pct
+smsp__warp_issue_stalled_selected_per_warp_active.pct
+smsp__warp_issue_stalled_dispatch_stall_per_warp_active.pct
+smsp__warp_issue_stalled_no_instruction_per_warp_active.pct
