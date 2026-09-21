@@ -34,7 +34,7 @@ fi
 pass "built in $BUILD"
 
 echo "[2] Nsight Compute can read performance counters"
-OUT=$("$NCU" --metrics sm__cycles_elapsed.avg -k 'regex:sgemm_01' -c 1 \
+OUT=$("$NCU" --metrics sm__cycles_elapsed.avg -k 'regex:sgemm_01_' -c 1 \
         "$BUILD/sgemm_bench" --profile --kernel naive --sizes 256 2>&1)
 if grep -q ERR_NVGPUCTRPERM <<<"$OUT"; then
   die "ERR_NVGPUCTRPERM: counters blocked (common on virtualized hosts). Either run with
