@@ -102,3 +102,8 @@ sgemm_target_setup(sgemm_host_test)
 enable_testing()
 add_test(NAME host_utils COMMAND sgemm_host_test)
 add_test(NAME correctness COMMAND sgemm_test --kernel all)
+
+# Stage 8: autotuner over template families (bench/autotune.cu).
+add_executable(sgemm_autotune bench/autotune.cu)
+sgemm_target_setup(sgemm_autotune)
+target_link_libraries(sgemm_autotune PRIVATE sgemm_kernels)
