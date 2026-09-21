@@ -28,7 +28,8 @@ pass "toolchain"
 echo "[1] build"
 if [[ ! -x $BUILD/sgemm_bench ]]; then
   CC_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)
-  cmake -S "$ROOT" -B "$BUILD" -DCMAKE_CUDA_ARCHITECTURES="80;$CC_ARCH" >/dev/null || die "cmake configure"
+  ARCHS=$([[ $CC_ARCH == 80 ]] && echo 80 || echo "80;$CC_ARCH")
+  cmake -S "$ROOT" -B "$BUILD" -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" >/dev/null || die "cmake configure"
   cmake --build "$BUILD" -j >/dev/null || die "build"
 fi
 pass "built in $BUILD"
