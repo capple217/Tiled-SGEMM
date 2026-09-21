@@ -7,7 +7,8 @@
 #              compute loop and the next tile's STS (the WAR barrier).
 #   synccheck  __syncthreads in divergent code (e.g. an early `return` added
 #              to a tiled kernel).
-#   initcheck  reads of uninitialised global memory (e.g. reading C when beta == 0).
+#   initcheck  reads of uninitialised global memory. (Reading C when beta == 0 is
+#              caught by the NaN pre-fill in the tests instead: C IS initialised.)
 # Slow (10-100x), so it runs the --quick test set with one kernel at a time.
 #
 #   scripts/sanitize.sh [kernel=all]
