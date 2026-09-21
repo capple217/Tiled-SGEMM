@@ -74,12 +74,16 @@ endfunction()
 # ---------------------------------------------------------------------------
 add_library(sgemm_kernels STATIC
   kernels/01_naive.cu
+  kernels/02_coalesced.cu
+  kernels/03_smem_tiling.cu
+  kernels/04_blocktiling_1d.cu
+  # kernels/05_blocktiling_2d.cu   <- add when stage 5 is written
   src/registry.cu
   src/cublas_ref.cu
   src/check.cu
   src/device_info.cu)
 sgemm_target_setup(sgemm_kernels)
-target_include_directories(sgemm_kernels PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(sgemm_kernels PUBLIC ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/kernels)
 target_link_libraries(sgemm_kernels PUBLIC CUDA::cudart CUDA::cublas)
 
 add_executable(sgemm_bench bench/bench.cu)
