@@ -9,6 +9,12 @@
 // noise that you selected for. The eval column is the number you're allowed
 // to quote.
 //
+// Some candidates spill registers: 1024-thread configs are capped at 64
+// registers/thread by __launch_bounds__, e.g. stage 4 <128,128,*,16>. That's
+// a real cost and the tuner measures it rather than filtering it out. Configure
+// with -DSGEMM_PTXAS_VERBOSE=ON to see which ones spill before you interpret a
+// ranking.
+//
 // Families are compile-time lists of template instantiations, filtered by a
 // constexpr validity predicate so invalid tilings never instantiate. To add
 // stage 5/6: write a `register_<family>()` like the one below and add it to
