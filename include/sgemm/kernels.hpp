@@ -42,8 +42,10 @@ void launch_03_smem_tiling(int M, int N, int K, float alpha, const float* A,
                            const float* B, float beta, float* C, cudaStream_t stream);
 void launch_04_blocktiling_1d(int M, int N, int K, float alpha, const float* A,
                               const float* B, float beta, float* C, cudaStream_t stream);
-// Stage 5 is yours: see kernels/05_blocktiling_2d.cu.
-// void launch_05_blocktiling_2d(int M, int N, int K, float alpha, const float* A,
-//                               const float* B, float beta, float* C, cudaStream_t stream);
+// SPOILER branch: Claude's reference stages 5 and 6.
+void launch_05_blocktiling_2d(int M, int N, int K, float alpha, const float* A,
+                              const float* B, float beta, float* C, cudaStream_t stream);
+void launch_06_vectorized(int M, int N, int K, float alpha, const float* A,
+                          const float* B, float beta, float* C, cudaStream_t stream);
 
 }  // namespace sgemm

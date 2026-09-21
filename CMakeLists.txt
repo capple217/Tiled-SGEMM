@@ -77,7 +77,8 @@ add_library(sgemm_kernels STATIC
   kernels/02_coalesced.cu
   kernels/03_smem_tiling.cu
   kernels/04_blocktiling_1d.cu
-  # kernels/05_blocktiling_2d.cu   <- add when stage 5 is written
+  kernels/05_blocktiling_2d.cu
+  kernels/06_vectorized.cu
   src/registry.cu
   src/cublas_ref.cu
   src/check.cu

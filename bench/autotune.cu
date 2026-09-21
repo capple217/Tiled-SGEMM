@@ -34,6 +34,8 @@
 #include <vector>
 
 #include "04_blocktiling_1d.cuh"
+#include "05_blocktiling_2d.cuh"
+#include "06_vectorized.cuh"
 #include "sgemm/check.hpp"
 #include "sgemm/common.hpp"
 #include "sgemm/cublas_ref.hpp"
@@ -86,8 +88,76 @@ std::vector<Candidate> register_blocktiling1d() {
   return v;
 }
 
+// ---- family: stage 5 (2D block tiling) -------------------------------------
+constexpr int k5BMN[] = {64, 128};
+constexpr int k5BK[] = {8, 16};
+constexpr int k5T[] = {4, 8};
+
+template <int BM, int BN, int BK, int TM, int TN>
+constexpr bool valid_05() {
+  constexpr int threads = BM * BN / (TM * TN);
+  return BM % TM == 0 && BN % TN == 0 && threads % 32 == 0 && threads >= 64 &&
+         threads <= 1024 && (BM * BK) % threads == 0 && (BK * BN) % threads == 0;
+}
+
+template <size_t I>
+void add_05(std::vector<Candidate>& v) {
+  constexpr int BM = k5BMN[I / 16], BN = k5BMN[(I / 8) % 2], BK = k5BK[(I / 4) % 2],
+                TM = k5T[(I / 2) % 2], TN = k5T[I % 2];
+  if constexpr (valid_05<BM, BN, BK, TM, TN>()) {
+    v.push_back({"BM" + std::to_string(BM) + "_BN" + std::to_string(BN) + "_BK" +
+                     std::to_string(BK) + "_TM" + std::to_string(TM) + "_TN" + std::to_string(TN),
+                 &launch_05_blocktiling_2d_cfg<BM, BN, BK, TM, TN>});
+  }
+}
+
+template <size_t... I>
+void add_all_05(std::vector<Candidate>& v, std::index_sequence<I...>) {
+  (add_05<I>(v), ...);
+}
+
+std::vector<Candidate> register_blocktiling2d() {
+  std::vector<Candidate> v;
+  add_all_05(v, std::make_index_sequence<32>{});
+  return v;
+}
+
+// ---- family: stage 6 (vectorized; thread tile fixed at 8x8, BN fixed at 128
+// ---- because the split-tile conflict argument needs 16 threadCols) ----------
+constexpr int k6BM[] = {64, 128, 256};
+constexpr int k6BK[] = {8, 16, 32};
+
+template <int BM, int BK>
+constexpr bool valid_06() {
+  constexpr int threads = BM * 128 / 64;
+  return (BM * BK / 4) % threads == 0 && (BK * 128 / 4) % threads == 0 &&
+         (BK * (BM + 4) + BK * 128) * 4 <= 48 * 1024;
+}
+
+template <size_t I>
+void add_06(std::vector<Candidate>& v) {
+  constexpr int BM = k6BM[I / 3], BK = k6BK[I % 3];
+  if constexpr (valid_06<BM, BK>()) {
+    v.push_back({"BM" + std::to_string(BM) + "_BN128_BK" + std::to_string(BK),
+                 &launch_06_vectorized_cfg<BM, 128, BK>});
+  }
+}
+
+template <size_t... I>
+void add_all_06(std::vector<Candidate>& v, std::index_sequence<I...>) {
+  (add_06<I>(v), ...);
+}
+
+std::vector<Candidate> register_vectorized() {
+  std::vector<Candidate> v;
+  add_all_06(v, std::make_index_sequence<9>{});
+  return v;
+}
+
 const std::map<std::string, std::vector<Candidate> (*)()> kFamilies = {
     {"blocktiling1d", &register_blocktiling1d},
+    {"blocktiling2d", &register_blocktiling2d},
+    {"vectorized", &register_vectorized},
 };
 
 // -----------------------------------------------------------------------------
