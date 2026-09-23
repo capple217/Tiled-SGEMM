@@ -2,7 +2,7 @@
 # Run every compiled-in kernel on the CPU emulator. Needs only g++ >= 11 (C++20
 # std::barrier) and python3. No GPU, no CUDA toolkit. Works on macOS with clang++.
 #
-#   tests/emu/run_emu_tests.sh [kernel-name]
+#   tests/emu/run_emu_tests.sh [kernel-name | variant prefix, e.g. v07]
 #
 # Kernel list = the kernels/*.cu lines that are NOT commented out in
 # CMakeLists.txt, so the emulator always tests exactly what the GPU build does.
@@ -28,5 +28,6 @@ cp "$ROOT/src/registry.cu" "$OUT/registry.emu.cpp"
 SAN=${SAN--fsanitize=address,undefined -fno-omit-frame-pointer}
 "$CXX" -std=c++20 -O1 -g -pthread -w $SAN \
   -I"$ROOT/tests/emu" -I"$ROOT/include" -I"$OUT" -I"$ROOT/kernels" \
-  "${OBJS[@]}" "$OUT/registry.emu.cpp" "$ROOT/tests/emu/emu_test.cpp" -o "$OUT/emu_test"
+  "${OBJS[@]}" "$OUT/registry.emu.cpp" "$ROOT/tests/emu/variants.cpp" \
+  "$ROOT/tests/emu/emu_test.cpp" -o "$OUT/emu_test"
 "$OUT/emu_test" "$@"

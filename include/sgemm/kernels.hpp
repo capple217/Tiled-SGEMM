@@ -46,5 +46,7 @@ void launch_05_blocktiling_2d(int M, int N, int K, float alpha, const float* A,
                               const float* B, float beta, float* C, cudaStream_t stream);
 void launch_06_vectorized(int M, int N, int K, float alpha, const float* A,
                           const float* B, float beta, float* C, cudaStream_t stream);
+void launch_07_warptiling(int M, int N, int K, float alpha, const float* A,
+                          const float* B, float beta, float* C, cudaStream_t stream);
 
 }  // namespace sgemm

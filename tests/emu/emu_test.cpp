@@ -14,6 +14,10 @@
 
 using namespace sgemm;
 
+namespace sgemm {
+std::vector<KernelSpec> emu_variants();  // tests/emu/variants.cpp
+}
+
 int main(int argc, char** argv) {
   const char* only = argc > 1 ? argv[1] : nullptr;
   struct Shape { int M, N, K; };
@@ -25,8 +29,13 @@ int main(int argc, char** argv) {
   const float cases[][2] = {{1.0f, 0.0f}, {1.5f, -0.75f}};
   int fails = 0, runs = 0;
 
-  for (const KernelSpec& k : all_kernels()) {
-    if (only && std::strcmp(only, k.name) != 0) continue;
+  // Registered defaults first, then non-default template configurations.
+  std::vector<KernelSpec> specs = all_kernels();
+  for (const KernelSpec& v : emu_variants()) specs.push_back(v);
+  for (const KernelSpec& k : specs) {
+    // Filter: exact name, or "vNN" prefix match for variants of a stage.
+    if (only && std::strcmp(only, k.name) != 0 && std::strncmp(only, k.name, std::strlen(only)) != 0)
+      continue;
     int kfails = 0;
     double worst = 0;
     for (const Shape& s : shapes) {
@@ -49,13 +58,13 @@ int main(int argc, char** argv) {
         if (!r.pass || div) {
           ++fails;
           ++kfails;
-          std::printf("  FAIL %-14s %4dx%4dx%4d a=%g b=%g: %lld bad (worst idx %lld got %g want %g)%s\n",
+          std::printf("  FAIL %-24s %4dx%4dx%4d a=%g b=%g: %lld bad (worst idx %lld got %g want %g)%s\n",
                       k.name, s.M, s.N, s.K, c[0], c[1], r.num_bad, r.worst_idx, r.got_worst,
                       r.ref_worst, div ? " [barrier after thread exit]" : "");
         }
       }
     }
-    std::printf("%-14s stage %d: %s (max err %.2f eps)\n", k.name, k.stage,
+    std::printf("%-24s stage %d: %s (max err %.2f eps)\n", k.name, k.stage,
                 kfails ? "FAILED" : "ok", worst);
   }
   std::printf("%d runs, %d failures\n", runs, fails);

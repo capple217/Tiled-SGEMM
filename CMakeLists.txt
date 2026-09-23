@@ -79,6 +79,7 @@ add_library(sgemm_kernels STATIC
   kernels/04_blocktiling_1d.cu
   kernels/05_blocktiling_2d.cu
   kernels/06_vectorized.cu
+  kernels/07_warptiling.cu
   src/registry.cu
   src/cublas_ref.cu
   src/check.cu

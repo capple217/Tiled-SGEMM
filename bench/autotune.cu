@@ -36,6 +36,7 @@
 #include "04_blocktiling_1d.cuh"
 #include "05_blocktiling_2d.cuh"
 #include "06_vectorized.cuh"
+#include "07_warptiling.cuh"
 #include "sgemm/check.hpp"
 #include "sgemm/common.hpp"
 #include "sgemm/cublas_ref.hpp"
@@ -154,10 +155,51 @@ std::vector<Candidate> register_vectorized() {
   return v;
 }
 
+// ---- family: stage 7 (warptiling). Lane layout fixed at 8x4 with 4x4 per lane,
+// ---- so WM must be a multiple of 32 and WN of 16. ---------------------------
+constexpr int k7BMN[] = {64, 128};
+constexpr int k7BK[] = {8, 16};
+constexpr int k7WM[] = {32, 64};
+constexpr int k7WN[] = {16, 32, 64};
+
+template <int BM, int BN, int BK, int WM, int WN>
+constexpr bool valid_07() {
+  if (BM % WM != 0 || BN % WN != 0) return false;
+  constexpr int threads = (BM / WM) * (BN / WN) * 32;
+  constexpr int outputs_per_thread = (WM / 32) * (WN / 16) * 16;
+  return threads >= 64 && threads <= 1024 && outputs_per_thread <= 128 &&
+         (BM * BK / 4) % threads == 0 && (BK * BN / 4) % threads == 0 &&
+         (BK * (BM + 4) + BK * BN) * 4 <= 48 * 1024;
+}
+
+template <size_t I>
+void add_07(std::vector<Candidate>& v) {
+  // I in [0, 48): BM(2) x BN(2) x BK(2) x WM(2) x WN(3), WN fastest.
+  constexpr int BM = k7BMN[I / 24], BN = k7BMN[(I / 12) % 2], BK = k7BK[(I / 6) % 2],
+                WM = k7WM[(I / 3) % 2], WN = k7WN[I % 3];
+  if constexpr (valid_07<BM, BN, BK, WM, WN>()) {
+    v.push_back({"BM" + std::to_string(BM) + "_BN" + std::to_string(BN) + "_BK" +
+                     std::to_string(BK) + "_WM" + std::to_string(WM) + "_WN" + std::to_string(WN),
+                 &launch_07_warptiling_cfg<BM, BN, BK, WM, WN>});
+  }
+}
+
+template <size_t... I>
+void add_all_07(std::vector<Candidate>& v, std::index_sequence<I...>) {
+  (add_07<I>(v), ...);
+}
+
+std::vector<Candidate> register_warptiling() {
+  std::vector<Candidate> v;
+  add_all_07(v, std::make_index_sequence<2 * 2 * 2 * 2 * 3>{});
+  return v;
+}
+
 const std::map<std::string, std::vector<Candidate> (*)()> kFamilies = {
     {"blocktiling1d", &register_blocktiling1d},
     {"blocktiling2d", &register_blocktiling2d},
     {"vectorized", &register_vectorized},
+    {"warptiling", &register_warptiling},
 };
 
 // -----------------------------------------------------------------------------
