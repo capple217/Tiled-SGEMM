@@ -236,6 +236,17 @@ std::vector<Candidate> register_tf32_wmma() {
   return v;
 }
 
+// Each family's default configuration (the one registered in src/registry.cu).
+// It is always evaluated on the held-out sizes, so the report shows tuned vs
+// default on the same sizes, which is the honest version of "autotuning gained X%".
+const std::map<std::string, std::string> kDefaults = {
+    {"blocktiling1d", "BM64_BN64_BK8_TM8"},
+    {"blocktiling2d", "BM128_BN128_BK8_TM8_TN8"},
+    {"vectorized", "BM128_BN128_BK8"},
+    {"warptiling", "BM128_BN128_BK8_WM64_WN32"},
+    {"tf32_wmma", "BM128_BN128_BK32_WM64_WN32"},
+};
+
 const std::map<std::string, std::vector<Candidate> (*)()> kFamilies = {
     {"blocktiling1d", &register_blocktiling1d},
     {"blocktiling2d", &register_blocktiling2d},
@@ -386,17 +397,38 @@ int main(int argc, char** argv) {
   std::vector<std::unique_ptr<ShapeCtx>> eval_ctx;
   for (const Shape& s : eval_s) eval_ctx.push_back(std::make_unique<ShapeCtx>(s, blas));
   std::printf("\nheld-out evaluation (the numbers you may quote):\n");
-  for (size_t r = 0; r < std::min<size_t>(3, ranked.size()); ++r) {
-    const Candidate& c = cands[ranked[r].second];
+  // Top 3 by tune score, plus the family default if it isn't among them.
+  std::vector<std::pair<size_t, double>> to_eval;  // (candidate idx, tune score)
+  for (size_t r = 0; r < std::min<size_t>(3, ranked.size()); ++r)
+    to_eval.push_back({ranked[r].second, ranked[r].first});
+  const auto def = kDefaults.find(family);
+  if (def != kDefaults.end()) {
+    bool present = false;
+    for (auto& e : to_eval) present |= cands[e.first].name == def->second;
+    for (size_t ci = 0; ci < cands.size() && !present; ++ci)
+      if (cands[ci].name == def->second) {
+        double score = 0;
+        for (auto& rk : ranked)
+          if (rk.second == ci) score = rk.first;
+        to_eval.push_back({ci, score});
+        present = true;
+      }
+  }
+  for (size_t r = 0; r < to_eval.size(); ++r) {
+    const Candidate& c = cands[to_eval[r].first];
+    const bool is_default = def != kDefaults.end() && c.name == def->second;
     std::vector<double> gfs;
     for (auto& x : eval_ctx) {
       const Shape& s = x->s;
       const Result res = measure(c, *x, warmup, iters, stream, flush, flush_bytes);
       gfs.push_back(res.gflops);
-      if (out) out << c.name << ",eval," << s.M << ',' << s.N << ',' << s.K << ',' << res.gflops << ',' << res.ok << '\n';
+      if (out)
+        out << c.name << (is_default ? ",eval_default," : ",eval,") << s.M << ',' << s.N << ','
+            << s.K << ',' << res.gflops << ',' << res.ok << '\n';
     }
-    std::printf("  #%zu %-28s tune %8.1f  eval %8.1f GFLOP/s\n", r + 1, c.name.c_str(),
-                ranked[r].first, geomean(gfs));
+    std::printf("  %-4s %-28s tune %8.1f  eval %8.1f GFLOP/s%s\n",
+                r < 3 ? ("#" + std::to_string(r + 1)).c_str() : "", c.name.c_str(),
+                to_eval[r].second, geomean(gfs), is_default ? "  (default config)" : "");
   }
   CUDA_CHECK(cudaFree(flush));
   CUDA_CHECK(cudaStreamDestroy(stream));

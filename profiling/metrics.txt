@@ -13,6 +13,8 @@ sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active
 smsp__sass_thread_inst_executed_op_ffma_pred_on.sum
 smsp__inst_executed.sum
 smsp__issue_active.avg.pct_of_peak_sustained_active
+# tensor-core pipe (stage 9 and cuBLAS TF32; ~0 for the FP32 stages)
+sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active
 
 # ---- DRAM -----------------------------------------------------------------
 dram__throughput.avg.pct_of_peak_sustained_elapsed

@@ -27,7 +27,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/build}
 NCU=${NCU:-ncu}
 CLOCK=${NCU_CLOCK_CONTROL:-base}
-OUT=$ROOT/profiling/reports
+OUT=${OUT:-$ROOT/profiling/reports}   # full_run.sh points this into its run directory
 mkdir -p "$OUT"
 
 # Our kernels are named sgemm_0N_*. (A looser 'sgemm_[0-9]' would also match cuBLAS
@@ -36,7 +36,15 @@ mkdir -p "$OUT"
 if [[ $KERNEL == cublas* ]]; then FILTER='regex:gemm'; COUNT=4; else FILTER='regex:sgemm_0[0-9]_'; COUNT=1; fi
 
 BENCH=("$BUILD/sgemm_bench" --profile --kernel "$KERNEL" --sizes "$SIZE")
-METRICS=$(grep -v '^\s*#' "$ROOT/profiling/metrics.txt" | grep -v '^\s*$' | paste -sd, -)
+# Keep only metrics this ncu/GPU knows: one unknown name makes ncu reject the
+# whole --metrics list. Dropped names are reported, not silently ignored.
+AVAIL=$("$NCU" --query-metrics 2>/dev/null | awk '{print $1}')
+KEEP=()
+while read -r m; do
+  [[ -z $m || $m == \#* ]] && continue
+  if grep -qx "${m%%.*}" <<<"$AVAIL"; then KEEP+=("$m"); else echo "   (skipping unknown metric $m)"; fi
+done < "$ROOT/profiling/metrics.txt"
+METRICS=$(IFS=,; echo "${KEEP[*]}")
 TAG="${KERNEL}_${SIZE}"
 
 echo "== full report -> $OUT/$TAG.ncu-rep"

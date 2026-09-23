@@ -4,7 +4,7 @@
 //               [--warmup 10] [--iters 50] [--alpha 1] [--beta 0]
 //               [--sm-clock-mhz MHZ] [--csv PATH] [--no-flush-l2]
 //               [--no-verify] [--cublas-math default|pedantic] [--profile]
-//               [--tf32-flop-per-clk-sm N]
+//               [--tf32-flop-per-clk-sm N] [--max-seconds-per-case S] [--list]
 //
 //   PRESET: quick | square | rect | odd | all.  LIST: 4096,1000x1500x2003,...
 //
@@ -24,6 +24,11 @@
 //  * At small sizes (<= 512) kernel time is ~microseconds: event resolution
 //    (~0.5 us) and launch latency are a real fraction of it. Treat those rows
 //    as latency measurements, not throughput.
+//  * --max-seconds-per-case S caps warmup + timed iterations per (kernel, size)
+//    using one probe launch to estimate cost (min 3 timed iterations). Slow
+//    early stages at 8192^3 otherwise dominate paid GPU time. The CSV "iters"
+//    column records how many were actually timed; a row with few iterations has
+//    a less reliable median, and its std shows it.
 //  * Precision-matched baselines. FP32 kernels are compared with FP32 cuBLAS
 //    (CUDA cores); TF32 kernels (stage 9) with TF32 cuBLAS (tensor cores), and
 //    their % of peak uses the TF32 tensor peak. A TF32 kernel is never shown as
@@ -31,6 +36,7 @@
 //  * --profile: run each selected kernel ONCE per size (no warmup, no cuBLAS
 //    baseline, no verify) so Nsight Compute captures exactly one launch.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +74,8 @@ struct Options {
   bool profile = false;
   CublasMath math = CublasMath::Default;
   int tf32_flop_per_clk_sm = 0;  // 0 = use the device_info.cu table
+  double max_seconds_per_case = 0;  // 0 = no cap
+  bool list = false;
 };
 
 [[noreturn]] void usage(const char* msg) {
@@ -147,6 +155,8 @@ Options parse_args(int argc, char** argv) {
     else if (a == "--no-verify") o.verify = false;
     else if (a == "--profile") o.profile = true;
     else if (a == "--tf32-flop-per-clk-sm") o.tf32_flop_per_clk_sm = std::atoi(next().c_str());
+    else if (a == "--max-seconds-per-case") o.max_seconds_per_case = std::atof(next().c_str());
+    else if (a == "--list") o.list = true;
     else if (a == "--cublas-math") {
       const std::string m = next();
       if (m == "default") o.math = CublasMath::Default;
@@ -179,8 +189,35 @@ std::string timestamp() {
 
 }  // namespace
 
+// Warmup/iteration counts for one case, capped by the time budget. One probe
+// launch (untimed by the stats, synchronised) estimates the per-launch cost.
+std::pair<int, int> budgeted_counts(const Options& opt, const Run& run, cudaStream_t s) {
+  if (opt.profile) return {0, 1};
+  if (opt.max_seconds_per_case <= 0) return {opt.warmup, opt.iters};
+  cudaEvent_t a, b;
+  CUDA_CHECK(cudaEventCreate(&a));
+  CUDA_CHECK(cudaEventCreate(&b));
+  CUDA_CHECK(cudaEventRecord(a, s));
+  run(s);
+  CUDA_CHECK(cudaEventRecord(b, s));
+  CUDA_CHECK(cudaEventSynchronize(b));
+  float ms = 0;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+  CUDA_CHECK(cudaEventDestroy(a));
+  CUDA_CHECK(cudaEventDestroy(b));
+  const int fit = static_cast<int>(opt.max_seconds_per_case * 1e3 / std::max(ms, 1e-3f));
+  const int iters = std::max(3, std::min(opt.iters, fit * 4 / 5));
+  const int warmup = std::min(opt.warmup, std::max(1, fit / 5));
+  return {warmup, iters};
+}
+
 int main(int argc, char** argv) {
   const Options opt = parse_args(argc, argv);
+  if (opt.list) {  // machine-readable: name stage precision
+    for (const auto& k : all_kernels())
+      std::printf("%s %d %s\n", k.name, k.stage, precision_name(k.precision));
+    return 0;
+  }
   const std::vector<Shape> shapes = parse_sizes(opt.sizes);
 
   // Resolve kernel selection. "cublas" / "cublas_tf32" can be named explicitly
@@ -314,9 +351,8 @@ int main(int argc, char** argv) {
       const Run run = [&](cudaStream_t st) {
         blas(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, st);
       };
-      const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
-                                           opt.profile ? 1 : opt.iters, stream,
-                                           flush_buf, flush_bytes));
+      const auto [nw, ni] = budgeted_counts(opt, run, stream);
+      const Stats st = summarize(time_runs(run, nw, ni, stream, flush_buf, flush_bytes));
       cublas_gflops = flops / (st.median * 1e6);
       emit("cublas", 0, Precision::FP32, st, cublas_gflops, -1, 0.0);
     }
@@ -343,9 +379,8 @@ int main(int argc, char** argv) {
       const Run run = [&](cudaStream_t st) {
         blas_tf32(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, st);
       };
-      const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
-                                           opt.profile ? 1 : opt.iters, stream,
-                                           flush_buf, flush_bytes));
+      const auto [nw, ni] = budgeted_counts(opt, run, stream);
+      const Stats st = summarize(time_runs(run, nw, ni, stream, flush_buf, flush_bytes));
       cublas_tf32_gflops = flops / (st.median * 1e6);
       emit("cublas_tf32", 0, Precision::TF32, st, cublas_tf32_gflops, verified, err_eps);
     }
@@ -372,9 +407,8 @@ int main(int argc, char** argv) {
       const Run run = [&](cudaStream_t st) {
         k->launch(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, st);
       };
-      const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
-                                           opt.profile ? 1 : opt.iters, stream,
-                                           flush_buf, flush_bytes));
+      const auto [nw, ni] = budgeted_counts(opt, run, stream);
+      const Stats st = summarize(time_runs(run, nw, ni, stream, flush_buf, flush_bytes));
       emit(k->name, k->stage, k->precision, st,
            k->precision == Precision::TF32 ? cublas_tf32_gflops : cublas_gflops, verified, err_eps);
     }
