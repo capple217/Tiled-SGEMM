@@ -1,4 +1,4 @@
-// SPOILER (branch reference/claude-stages-5-6): Claude's stage 6.
+// Stage 6 default configuration.
 // Kernel + explanation in 06_vectorized.cuh. Default <BM=128, BN=128, BK=8>, 8x8 thread tile.
 
 #include "06_vectorized.cuh"

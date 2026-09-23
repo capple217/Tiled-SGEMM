@@ -1,10 +1,4 @@
 #pragma once
-// ============================================================================
-//  SPOILER: Claude's reference implementation of stage 5, on the branch
-//  reference/claude-stages-5-6. Main has only the spec (TODO(Fasih)).
-//  Write yours first, then diff.
-// ============================================================================
-//
 // Stage 5 — 2D block/register tiling. Each thread owns a TM x TN tile of C.
 // Per k-step it loads TM values of A and TN values of B from smem into
 // registers and does their outer product: TM*TN FFMAs from TM + TN loads.

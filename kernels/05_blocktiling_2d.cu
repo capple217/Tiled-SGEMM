@@ -1,4 +1,4 @@
-// SPOILER (branch reference/claude-stages-5-6): Claude's stage 5.
+// Stage 5 default configuration.
 // Kernel + explanation in 05_blocktiling_2d.cuh. Default <128, 128, 8, 8, 8>.
 
 #include "05_blocktiling_2d.cuh"

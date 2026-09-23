@@ -1,9 +1,4 @@
 #pragma once
-// ============================================================================
-//  SPOILER: Claude's stage 6, on branch reference/claude-stages-5-6.
-//  Builds directly on stage 5, so it reveals a stage-5 solution.
-// ============================================================================
-//
 // Stage 6 — vectorized (128-bit) global access + a shared-memory layout whose
 // inner-loop reads are conflict-free LDS.128s.
 //
