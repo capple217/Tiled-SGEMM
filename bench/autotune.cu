@@ -37,6 +37,7 @@
 #include "05_blocktiling_2d.cuh"
 #include "06_vectorized.cuh"
 #include "07_warptiling.cuh"
+#include "09_tf32_wmma.cuh"
 #include "sgemm/check.hpp"
 #include "sgemm/common.hpp"
 #include "sgemm/cublas_ref.hpp"
@@ -52,6 +53,7 @@ namespace {
 struct Candidate {
   std::string name;  // e.g. "BM64_BN64_BK8_TM8"
   LaunchFn launch;
+  Precision precision = Precision::FP32;  // selects the verification tolerance
 };
 
 // ---- family: stage 4 (1D block tiling) -------------------------------------
@@ -195,11 +197,51 @@ std::vector<Candidate> register_warptiling() {
   return v;
 }
 
+// ---- family: stage 9 (TF32 wmma). Verified with the TF32 tolerance; rank it
+// ---- only against itself, never against the FP32 families. -----------------
+constexpr int k9BMN[] = {64, 128};
+constexpr int k9BK[] = {16, 32};
+constexpr int k9W[] = {32, 64};
+
+template <int BM, int BN, int BK, int WM, int WN>
+constexpr bool valid_09() {
+  if (BM % WM != 0 || BN % WN != 0) return false;
+  constexpr int warps = (BM / WM) * (BN / WN);
+  constexpr int threads = warps * 32;
+  return threads >= 64 && threads <= 1024 && (BM * BK / 4) % threads == 0 &&
+         (BK * BN / 4) % threads == 0 &&
+         (BM * (BK + 4) + BK * (BN + 4) + warps * 256) * 4 <= 48 * 1024;
+}
+
+template <size_t I>
+void add_09(std::vector<Candidate>& v) {
+  // I in [0, 32): BM(2) x BN(2) x BK(2) x WM(2) x WN(2), WN fastest.
+  constexpr int BM = k9BMN[I / 16], BN = k9BMN[(I / 8) % 2], BK = k9BK[(I / 4) % 2],
+                WM = k9W[(I / 2) % 2], WN = k9W[I % 2];
+  if constexpr (valid_09<BM, BN, BK, WM, WN>()) {
+    v.push_back({"BM" + std::to_string(BM) + "_BN" + std::to_string(BN) + "_BK" +
+                     std::to_string(BK) + "_WM" + std::to_string(WM) + "_WN" + std::to_string(WN),
+                 &launch_09_tf32_wmma_cfg<BM, BN, BK, WM, WN>, Precision::TF32});
+  }
+}
+
+template <size_t... I>
+void add_all_09(std::vector<Candidate>& v, std::index_sequence<I...>) {
+  (add_09<I>(v), ...);
+}
+
+std::vector<Candidate> register_tf32_wmma() {
+  std::vector<Candidate> v;
+  add_all_09(v, std::make_index_sequence<2 * 2 * 2 * 2 * 2>{});
+  return v;
+}
+
 const std::map<std::string, std::vector<Candidate> (*)()> kFamilies = {
     {"blocktiling1d", &register_blocktiling1d},
     {"blocktiling2d", &register_blocktiling2d},
     {"vectorized", &register_vectorized},
     {"warptiling", &register_warptiling},
+    {"tf32_wmma", &register_tf32_wmma},
 };
 
 // -----------------------------------------------------------------------------
@@ -261,7 +303,8 @@ Result measure(const Candidate& c, ShapeCtx& x, int warmup, int iters, cudaStrea
   CUDA_CHECK(cudaStreamSynchronize(stream));
   std::vector<float> got(nC);
   CUDA_CHECK(cudaMemcpy(got.data(), x.dC, nC * 4, cudaMemcpyDeviceToHost));
-  const bool ok = compare(got.data(), x.ref.ref.data(), x.ref.scale.data(), nC, s.K).pass;
+  const bool ok =
+      compare(got.data(), x.ref.ref.data(), x.ref.scale.data(), nC, s.K, c.precision).pass;
   double gf = 0;
   if (ok) {
     const Run run = [&](cudaStream_t st) { c.launch(s.M, s.N, s.K, 1.0f, x.dA, x.dB, 0.0f, x.dC, st); };

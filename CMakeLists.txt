@@ -80,6 +80,7 @@ add_library(sgemm_kernels STATIC
   kernels/05_blocktiling_2d.cu
   kernels/06_vectorized.cu
   kernels/07_warptiling.cu
+  kernels/09_tf32_wmma.cu   # TF32 tensor cores: needs sm_80+
   src/registry.cu
   src/cublas_ref.cu
   src/check.cu

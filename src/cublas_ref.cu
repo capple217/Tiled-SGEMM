@@ -7,8 +7,10 @@ namespace sgemm {
 
 CublasSgemm::CublasSgemm(CublasMath mode) : mode_(mode) {
   CUBLAS_CHECK(cublasCreate(&handle_));
-  CUBLAS_CHECK(cublasSetMathMode(
-      handle_, mode == CublasMath::Pedantic ? CUBLAS_PEDANTIC_MATH : CUBLAS_DEFAULT_MATH));
+  const cublasMath_t m = mode == CublasMath::Pedantic ? CUBLAS_PEDANTIC_MATH
+                         : mode == CublasMath::TF32   ? CUBLAS_TF32_TENSOR_OP_MATH
+                                                      : CUBLAS_DEFAULT_MATH;
+  CUBLAS_CHECK(cublasSetMathMode(handle_, m));
   // NVIDIA_TF32_OVERRIDE=0 can only *disable* TF32; nothing in the env can force
   // it on for cublasSgemm + DEFAULT_MATH. Still, surface it so a CSV never
   // carries an unexplained environment.
@@ -46,7 +48,9 @@ int CublasSgemm::version() const {
 }
 
 const char* CublasSgemm::mode_name() const {
-  return mode_ == CublasMath::Pedantic ? "pedantic" : "default_fp32";
+  return mode_ == CublasMath::Pedantic ? "pedantic"
+         : mode_ == CublasMath::TF32   ? "tf32_tensor_op"
+                                       : "default_fp32";
 }
 
 }  // namespace sgemm

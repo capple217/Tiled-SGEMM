@@ -32,7 +32,10 @@ namespace sgemm {
 // Verify, don't trust: scripts/env_check.sh runs cuBLAS under ncu and prints the
 // kernel name. An FP32 CUDA-core kernel is named like "ampere_sgemm_128x64_nn";
 // anything with "tf32"/"s1688"/"16816" means tensor cores are in play.
-enum class CublasMath { Default, Pedantic };
+//   TF32     : CUBLAS_TF32_TENSOR_OP_MATH. The honest baseline for a TF32
+//              tensor-core kernel (stage 9) and ONLY for that. Its result is
+//              checked with the TF32 tolerance.
+enum class CublasMath { Default, Pedantic, TF32 };
 
 class CublasSgemm {
  public:

@@ -10,6 +10,7 @@
 #include "05_blocktiling_2d.emu.hpp"
 #include "06_vectorized.emu.hpp"
 #include "07_warptiling.emu.hpp"
+#include "09_tf32_wmma.emu.hpp"
 #include "sgemm/kernels.hpp"
 
 namespace sgemm {
@@ -24,6 +25,8 @@ std::vector<KernelSpec> emu_variants() {
       {"v06<128,128,16>", 6, "", &launch_06_vectorized_cfg<128, 128, 16>},
       {"v07<64,64,8,32,32>", 7, "", &launch_07_warptiling_cfg<64, 64, 8, 32, 32>},
       {"v07<128,128,16,64,64>", 7, "", &launch_07_warptiling_cfg<128, 128, 16, 64, 64>},
+      {"v09<64,64,16,32,32>", 9, "", &launch_09_tf32_wmma_cfg<64, 64, 16, 32, 32>, Precision::TF32},
+      {"v09<128,64,32,32,32>", 9, "", &launch_09_tf32_wmma_cfg<128, 64, 32, 32, 32>, Precision::TF32},
   };
 }
 

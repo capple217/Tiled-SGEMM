@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
         k.launch(s.M, s.N, s.K, c[0], A.data(), B.data(), c[1], C.data(), nullptr);
         cpu_reference(s.M, s.N, s.K, c[0], A.data(), B.data(), c[1], C0.data(), ref.data(),
                       scale.data());
-        const CheckResult r = compare(C.data(), ref.data(), scale.data(), C.size(), s.K);
+        const CheckResult r = compare(C.data(), ref.data(), scale.data(), C.size(), s.K, k.precision);
         ++runs;
         worst = std::max(worst, r.max_err / FLT_EPSILON);
         const bool div = ::emu::g_divergent_barrier;
@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
         }
       }
     }
-    std::printf("%-24s stage %d: %s (max err %.2f eps)\n", k.name, k.stage,
+    std::printf("%-24s stage %d %s: %s (max err %.2f eps)\n", k.name, k.stage, precision_name(k.precision),
                 kfails ? "FAILED" : "ok", worst);
   }
   std::printf("%d runs, %d failures\n", runs, fails);

@@ -17,6 +17,8 @@
 #include <string_view>
 #include <vector>
 
+#include "sgemm/precision.hpp"
+
 namespace sgemm {
 
 using LaunchFn = void (*)(int M, int N, int K, float alpha, const float* A,
@@ -28,6 +30,7 @@ struct KernelSpec {
   int stage;             // roadmap stage number
   const char* targets;   // the hardware bottleneck this stage attacks
   LaunchFn launch;
+  Precision precision = Precision::FP32;  // selects tolerance, cuBLAS baseline, peak
 };
 
 const std::vector<KernelSpec>& all_kernels();
@@ -48,5 +51,8 @@ void launch_06_vectorized(int M, int N, int K, float alpha, const float* A,
                           const float* B, float beta, float* C, cudaStream_t stream);
 void launch_07_warptiling(int M, int N, int K, float alpha, const float* A,
                           const float* B, float beta, float* C, cudaStream_t stream);
+// (Stage 8 is the autotuner, bench/autotune.cu: no kernel of its own.)
+void launch_09_tf32_wmma(int M, int N, int K, float alpha, const float* A,
+                         const float* B, float beta, float* C, cudaStream_t stream);
 
 }  // namespace sgemm

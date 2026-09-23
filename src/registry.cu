@@ -12,6 +12,9 @@ const std::vector<KernelSpec>& all_kernels() {
       {"blocktiling2d", 5, "LDS per FFMA -> TMxTN register outer product", launch_05_blocktiling_2d},
       {"vectorized", 6, "memory-instruction count + smem bank conflicts -> float4, AsT, split tile", launch_06_vectorized},
       {"warptiling", 7, "smem bandwidth per warp -> compact warp tile (8x4 lanes, 2x2 sub-tiles)", launch_07_warptiling},
+      // Stage 9 changes the arithmetic: TF32 baseline, TF32 peak, TF32 tolerance.
+      {"tf32_wmma", 9, "FP32 FFMA throughput ceiling -> TF32 tensor cores (wmma 16x16x8)",
+       launch_09_tf32_wmma, Precision::TF32},
   };
   return k;
 }

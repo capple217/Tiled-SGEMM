@@ -20,7 +20,30 @@ int fp32_lanes(int major, int minor) {
   if (major >= 10) return 128;                  // Blackwell (verify per SKU)
   return 0;
 }
+// Dense TF32 tensor-core FLOP per clock per SM, from published dense TF32 peaks
+// divided by (SMs x boost clock). Check against your SKU's datasheet.
+//   A100 (8.0):  156 TFLOPS / (108 x 1.41 GHz)  = 1024
+//   A10/A40/L4 (8.6/8.9 pro): e.g. A10 62.5 / (72 x 1.695) = 512
+//   RTX 3090/4090 (8.6/8.9 GeForce): 35.6 / (82 x 1.695)   = 256
+//     (GeForce halves tensor throughput with FP32 accumulate)
+//   H100 SXM (9.0): 494.7 / (132 x 1.83)            = 2048
+int tf32_rate(int major, int minor, const std::string& name, std::string& src) {
+  if (major == 8 && minor == 0) { src = "table:sm80"; return 1024; }
+  if (major == 8 && (minor == 6 || minor == 9)) {
+    const bool geforce = name.find("GeForce") != std::string::npos;
+    src = geforce ? "table:sm8x_geforce" : "table:sm8x_pro";
+    return geforce ? 256 : 512;
+  }
+  if (major == 9) { src = "table:sm90"; return 2048; }
+  src = "unknown";
+  return 0;
+}
 }  // namespace
+
+double DeviceInfo::peak_tf32_gflops(int sm_clock_mhz) const {
+  if (tf32_flop_per_clk_sm == 0 || sm_clock_mhz <= 0) return 0.0;
+  return static_cast<double>(sm_count) * tf32_flop_per_clk_sm * sm_clock_mhz / 1e3;
+}
 
 double DeviceInfo::peak_fp32_gflops(int sm_clock_mhz) const {
   if (fp32_lanes_per_sm == 0 || sm_clock_mhz <= 0) return 0.0;
@@ -41,6 +64,7 @@ DeviceInfo query_device(int dev) {
   d.sm_count = p.multiProcessorCount;
   d.l2_bytes = p.l2CacheSize;
   d.fp32_lanes_per_sm = fp32_lanes(p.major, p.minor);
+  d.tf32_flop_per_clk_sm = tf32_rate(p.major, p.minor, d.name, d.tf32_source);
   // Clock fields on cudaDeviceProp are deprecated (removed in CUDA 13);
   // the attribute API is stable. Values are in kHz.
   int khz = 0;

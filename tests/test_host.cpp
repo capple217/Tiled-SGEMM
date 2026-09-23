@@ -6,6 +6,8 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 
@@ -41,6 +43,36 @@ static void emulate_fp32(int M, int N, int K, float alpha, const float* A, const
       for (float p : part) acc += p;
       const size_t idx = size_t(i) * N + j;
       out[idx] = beta == 0.0f ? alpha * acc : alpha * acc + beta * C0[idx];
+    }
+}
+
+// TF32 input rounding, two ways. RN-away is what cvt.rna.tf32.f32 /
+// wmma::__float_to_tf32 does; truncation is the worst case we budget for.
+static float tf32_round(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u = (u + 0x1000u) & 0xFFFFE000u;  // add half-ulp of the 13 dropped bits, then clear them
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+static float tf32_trunc(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u &= 0xFFFFE000u;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+// A TF32 tensor-core GEMM as far as rounding is concerned: operands converted,
+// products accumulated in FP32.
+static void emulate_tf32(int M, int N, int K, const float* A, const float* B, float* out,
+                         float (*cvt)(float), int drop_k = -1) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        if (k != drop_k) acc = std::fmaf(cvt(A[size_t(i) * K + k]), cvt(B[size_t(k) * N + j]), acc);
+      out[size_t(i) * N + j] = acc;
     }
 }
 
@@ -99,6 +131,51 @@ int main() {
         EXPECT(!r.pass, "dropped k-term NOT detected: %dx%dx%d err=%.2f eps", s.M, s.N, s.K,
                r.max_err / FLT_EPSILON);
       }
+    }
+  }
+
+  // TF32 tolerance, from both sides.
+  {
+    const Shp tshapes[] = {{8, 8, 64}, {16, 16, 256}, {8, 8, 4096}, {4, 4, 16384}};
+    for (const Shp& s : tshapes) {
+      std::vector<float> A(size_t(s.M) * s.K), B(size_t(s.K) * s.N), C0(size_t(s.M) * s.N, 0.f);
+      fill_uniform(A.data(), A.size(), 21);
+      fill_uniform(B.data(), B.size(), 22);
+      std::vector<float> ref(C0.size()), scale(C0.size()), got(C0.size());
+      cpu_reference(s.M, s.N, s.K, 1.0f, A.data(), B.data(), 0.0f, C0.data(), ref.data(), scale.data());
+      for (auto cvt : {&tf32_round, &tf32_trunc}) {
+        emulate_tf32(s.M, s.N, s.K, A.data(), B.data(), got.data(), cvt);
+        const CheckResult r = compare(got.data(), ref.data(), scale.data(), got.size(), s.K, Precision::TF32);
+        EXPECT(r.pass, "correct TF32 result rejected: %dx%dx%d err=%.3g tol=%.3g", s.M, s.N, s.K,
+               r.max_err, r.tol);
+        std::printf("  tf32 emu %5dx%5dx%5d %-5s  max_err=%.2e  tol=%.2e  (fp32 check would %s)\n",
+                    s.M, s.N, s.K, cvt == &tf32_round ? "RN" : "trunc", r.max_err, r.tol,
+                    compare(got.data(), ref.data(), scale.data(), got.size(), s.K).pass ? "pass" : "FAIL");
+      }
+      if (s.K <= 256) {  // dropped-term sensitivity only claimed for small K (see host_utils.hpp)
+        emulate_tf32(s.M, s.N, s.K, A.data(), B.data(), got.data(), &tf32_round, s.K - 1);
+        const CheckResult r = compare(got.data(), ref.data(), scale.data(), got.size(), s.K, Precision::TF32);
+        EXPECT(!r.pass, "TF32: dropped k-term NOT detected at K=%d (err %.3g tol %.3g)", s.K, r.max_err, r.tol);
+      }
+    }
+  }
+
+  // An FP32 kernel that secretly computed in TF32 must FAIL the FP32 check.
+  // (Needs enough outputs for the max error to show: 32x32 here.)
+  {
+    for (int K : {256, 1024, 4096, 8192}) {
+      const int M = 32, N = 32;
+      std::vector<float> A(size_t(M) * K), B(size_t(K) * N), C0(size_t(M) * N, 0.f);
+      fill_uniform(A.data(), A.size(), 31);
+      fill_uniform(B.data(), B.size(), 32);
+      std::vector<float> ref(C0.size()), scale(C0.size()), got(C0.size());
+      cpu_reference(M, N, K, 1.0f, A.data(), B.data(), 0.0f, C0.data(), ref.data(), scale.data());
+      emulate_tf32(M, N, K, A.data(), B.data(), got.data(), &tf32_round);
+      const CheckResult r = compare(got.data(), ref.data(), scale.data(), got.size(), K);
+      EXPECT(!r.pass, "TF32 result PASSED the FP32 check at K=%d (err %.2f eps, tol %.2f eps)", K,
+             r.max_err / FLT_EPSILON, r.tol / FLT_EPSILON);
+      std::printf("  tf32-vs-fp32-check K=%5d: max_err=%7.1f eps  fp32 tol=%5.1f eps -> %s\n", K,
+                  r.max_err / FLT_EPSILON, r.tol / FLT_EPSILON, r.pass ? "ACCEPTED (bad)" : "rejected");
     }
   }
 

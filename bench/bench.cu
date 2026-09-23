@@ -1,9 +1,10 @@
 // Benchmark driver.
 //
-//   sgemm_bench [--kernel all|cublas|NAME[,NAME...]] [--sizes PRESET|LIST]
+//   sgemm_bench [--kernel all|cublas|cublas_tf32|NAME[,NAME...]] [--sizes PRESET|LIST]
 //               [--warmup 10] [--iters 50] [--alpha 1] [--beta 0]
 //               [--sm-clock-mhz MHZ] [--csv PATH] [--no-flush-l2]
 //               [--no-verify] [--cublas-math default|pedantic] [--profile]
+//               [--tf32-flop-per-clk-sm N]
 //
 //   PRESET: quick | square | rect | odd | all.  LIST: 4096,1000x1500x2003,...
 //
@@ -23,6 +24,10 @@
 //  * At small sizes (<= 512) kernel time is ~microseconds: event resolution
 //    (~0.5 us) and launch latency are a real fraction of it. Treat those rows
 //    as latency measurements, not throughput.
+//  * Precision-matched baselines. FP32 kernels are compared with FP32 cuBLAS
+//    (CUDA cores); TF32 kernels (stage 9) with TF32 cuBLAS (tensor cores), and
+//    their % of peak uses the TF32 tensor peak. A TF32 kernel is never shown as
+//    a % of FP32 cuBLAS. The "precision" CSV column says which applies.
 //  * --profile: run each selected kernel ONCE per size (no warmup, no cuBLAS
 //    baseline, no verify) so Nsight Compute captures exactly one launch.
 
@@ -62,6 +67,7 @@ struct Options {
   bool verify = true;
   bool profile = false;
   CublasMath math = CublasMath::Default;
+  int tf32_flop_per_clk_sm = 0;  // 0 = use the device_info.cu table
 };
 
 [[noreturn]] void usage(const char* msg) {
@@ -140,6 +146,7 @@ Options parse_args(int argc, char** argv) {
     else if (a == "--no-flush-l2") o.flush_l2 = false;
     else if (a == "--no-verify") o.verify = false;
     else if (a == "--profile") o.profile = true;
+    else if (a == "--tf32-flop-per-clk-sm") o.tf32_flop_per_clk_sm = std::atoi(next().c_str());
     else if (a == "--cublas-math") {
       const std::string m = next();
       if (m == "default") o.math = CublasMath::Default;
@@ -155,6 +162,7 @@ Options parse_args(int argc, char** argv) {
 struct Row {
   std::string kernel;
   int stage;
+  Precision precision;
   Shape shape;
   Stats st;
   double gflops_median, gflops_best, pct_cublas, pct_peak;
@@ -175,24 +183,37 @@ int main(int argc, char** argv) {
   const Options opt = parse_args(argc, argv);
   const std::vector<Shape> shapes = parse_sizes(opt.sizes);
 
-  // Resolve kernel selection. "cublas" is selectable (useful for --profile).
-  bool want_cublas_timed = !opt.profile;
+  // Resolve kernel selection. "cublas" / "cublas_tf32" can be named explicitly
+  // (e.g. for --profile). Otherwise each baseline runs iff some selected kernel
+  // has that precision, so every kernel gets its precision-matched denominator.
+  bool sel_cublas = false, sel_cublas_tf32 = false;
   std::vector<const KernelSpec*> kernels;
   if (opt.kernels == "all") {
     for (const auto& k : all_kernels()) kernels.push_back(&k);
   } else {
     for (const auto& name : split(opt.kernels, ',')) {
-      if (name == "cublas") { want_cublas_timed = true; continue; }
+      if (name == "cublas") { sel_cublas = true; continue; }
+      if (name == "cublas_tf32") { sel_cublas_tf32 = true; continue; }
       const KernelSpec* k = find_kernel(name);
       if (!k) usage(("unknown kernel: " + name).c_str());
       kernels.push_back(k);
     }
   }
+  bool any_fp32 = false, any_tf32 = false;
+  for (const KernelSpec* k : kernels) (k->precision == Precision::TF32 ? any_tf32 : any_fp32) = true;
+  const bool want_cublas_timed = sel_cublas || (!opt.profile && any_fp32);
+  const bool want_cublas_tf32 = sel_cublas_tf32 || (!opt.profile && any_tf32);
 
-  const DeviceInfo dev = query_device();
+  DeviceInfo dev = query_device();
+  if (opt.tf32_flop_per_clk_sm > 0) {
+    dev.tf32_flop_per_clk_sm = opt.tf32_flop_per_clk_sm;
+    dev.tf32_source = "user_override";
+  }
   CublasSgemm blas(opt.math);
+  CublasSgemm blas_tf32(CublasMath::TF32);
   const int clock_mhz = opt.sm_clock_mhz > 0 ? opt.sm_clock_mhz : dev.max_sm_clock_mhz;
   const double peak = dev.peak_fp32_gflops(clock_mhz);
+  const double peak_tf32 = dev.peak_tf32_gflops(clock_mhz);
 
   // ---- metadata: everything needed to reproduce / judge a number ----------
   std::ostringstream meta;
@@ -206,6 +227,9 @@ int main(int argc, char** argv) {
        << "# peak_clock_mhz=" << clock_mhz << "\n"
        << "# peak_clock_source=" << (opt.sm_clock_mhz > 0 ? "user_locked" : "driver_max_boost") << "\n"
        << "# peak_fp32_gflops=" << peak << "\n"
+       << "# tf32_flop_per_clk_sm=" << dev.tf32_flop_per_clk_sm << "\n"
+       << "# tf32_peak_source=" << dev.tf32_source << "\n"
+       << "# peak_tf32_gflops=" << peak_tf32 << "\n"
        << "# peak_dram_gbs=" << dev.peak_dram_gbs() << "\n"
        << "# l2_bytes=" << dev.l2_bytes << "\n"
        << "# driver_version=" << dev.driver_version << "\n"
@@ -233,8 +257,8 @@ int main(int argc, char** argv) {
   if (opt.flush_l2 && !opt.profile) CUDA_CHECK(cudaMalloc(&flush_buf, flush_bytes));
 
   std::vector<Row> rows;
-  std::printf("\n%-10s %6s %6s %6s %10s %9s %8s %9s %8s %7s\n", "kernel", "M", "N", "K",
-              "median_ms", "std_ms", "GFLOPS", "%cuBLAS", "%peak", "check");
+  std::printf("\n%-14s %4s %6s %6s %6s %10s %9s %8s %9s %8s %7s\n", "kernel", "prec", "M", "N",
+              "K", "median_ms", "std_ms", "GFLOPS", "%cuBLAS", "%peak", "check");
 
   for (size_t si = 0; si < shapes.size(); ++si) {
     const Shape s = shapes[si];
@@ -265,18 +289,20 @@ int main(int argc, char** argv) {
     };
 
     Reference ref;
-    const bool do_verify = opt.verify && !opt.profile && !kernels.empty();
+    const bool do_verify = opt.verify && !opt.profile && (!kernels.empty() || want_cublas_tf32);
     if (do_verify) ref = gpu_reference(blas, s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, hC0);
 
-    auto emit = [&](const std::string& name, int stage, const Stats& st, double cublas_gf,
-                    int verified, double err_eps) {
-      Row r{name, stage, s, st, flops / (st.median * 1e6), flops / (st.min * 1e6), 0, 0,
+    // cublas_gf / pk are the PRECISION-MATCHED baseline and peak.
+    auto emit = [&](const std::string& name, int stage, Precision prec, const Stats& st,
+                    double cublas_gf, int verified, double err_eps) {
+      const double pk = prec == Precision::TF32 ? peak_tf32 : peak;
+      Row r{name, stage, prec, s, st, flops / (st.median * 1e6), flops / (st.min * 1e6), 0, 0,
             verified, err_eps};
       r.pct_cublas = cublas_gf > 0 ? 100.0 * r.gflops_median / cublas_gf : 0.0;
-      r.pct_peak = peak > 0 ? 100.0 * r.gflops_median / peak : 0.0;
-      std::printf("%-10s %6d %6d %6d %10.4f %9.4f %8.1f %8.1f%% %7.1f%% %7s\n",
-                  name.c_str(), s.M, s.N, s.K, st.median, st.stddev, r.gflops_median,
-                  r.pct_cublas, r.pct_peak,
+      r.pct_peak = pk > 0 ? 100.0 * r.gflops_median / pk : 0.0;
+      std::printf("%-14s %4s %6d %6d %6d %10.4f %9.4f %8.1f %8.1f%% %7.1f%% %7s\n",
+                  name.c_str(), precision_name(prec), s.M, s.N, s.K, st.median, st.stddev,
+                  r.gflops_median, r.pct_cublas, r.pct_peak,
                   verified == 1 ? "ok" : verified == 0 ? "FAIL" : "-");
       rows.push_back(r);
     };
@@ -292,7 +318,36 @@ int main(int argc, char** argv) {
                                            opt.profile ? 1 : opt.iters, stream,
                                            flush_buf, flush_bytes));
       cublas_gflops = flops / (st.median * 1e6);
-      emit("cublas", 0, st, cublas_gflops, -1, 0.0);
+      emit("cublas", 0, Precision::FP32, st, cublas_gflops, -1, 0.0);
+    }
+
+    // ---- cuBLAS TF32 baseline (only alongside TF32 kernels) -----------------
+    // Verified against the FP32 reference with the TF32 tolerance: this also
+    // confirms the TF32 baseline itself is numerically what we think it is.
+    double cublas_tf32_gflops = 0.0;
+    if (want_cublas_tf32) {
+      int verified = -1;
+      double err_eps = 0.0;
+      if (do_verify) {
+        reset_C();
+        blas_tf32(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> got(nC);
+        CUDA_CHECK(cudaMemcpy(got.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost));
+        const CheckResult cr = compare(got.data(), ref.ref.data(), ref.scale.data(), nC, s.K,
+                                       Precision::TF32);
+        verified = cr.pass ? 1 : 0;
+        err_eps = cr.max_err / FLT_EPSILON;
+      }
+      reset_C();
+      const Run run = [&](cudaStream_t st) {
+        blas_tf32(s.M, s.N, s.K, opt.alpha, dA, dB, opt.beta, dC, st);
+      };
+      const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
+                                           opt.profile ? 1 : opt.iters, stream,
+                                           flush_buf, flush_bytes));
+      cublas_tf32_gflops = flops / (st.median * 1e6);
+      emit("cublas_tf32", 0, Precision::TF32, st, cublas_tf32_gflops, verified, err_eps);
     }
 
     // ---- our kernels -------------------------------------------------------
@@ -305,7 +360,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::vector<float> got(nC);
         CUDA_CHECK(cudaMemcpy(got.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost));
-        const CheckResult cr = compare(got.data(), ref.ref.data(), ref.scale.data(), nC, s.K);
+        const CheckResult cr =
+            compare(got.data(), ref.ref.data(), ref.scale.data(), nC, s.K, k->precision);
         verified = cr.pass ? 1 : 0;
         err_eps = cr.max_err / FLT_EPSILON;
         if (!cr.pass)
@@ -319,7 +375,8 @@ int main(int argc, char** argv) {
       const Stats st = summarize(time_runs(run, opt.profile ? 0 : opt.warmup,
                                            opt.profile ? 1 : opt.iters, stream,
                                            flush_buf, flush_bytes));
-      emit(k->name, k->stage, st, cublas_gflops, verified, err_eps);
+      emit(k->name, k->stage, k->precision, st,
+           k->precision == Precision::TF32 ? cublas_tf32_gflops : cublas_gflops, verified, err_eps);
     }
 
     CUDA_CHECK(cudaFree(dA));
@@ -335,10 +392,10 @@ int main(int argc, char** argv) {
     std::ofstream f(opt.csv);
     if (!f) usage(("cannot open " + opt.csv).c_str());
     f << meta.str();
-    f << "kernel,stage,M,N,K,ms_median,ms_mean,ms_std,ms_min,ms_max,iters,"
+    f << "kernel,stage,precision,M,N,K,ms_median,ms_mean,ms_std,ms_min,ms_max,iters,"
          "gflops_median,gflops_best,pct_cublas,pct_peak,verified,max_err_eps\n";
     for (const Row& r : rows) {
-      f << r.kernel << ',' << r.stage << ',' << r.shape.M << ',' << r.shape.N << ','
+      f << r.kernel << ',' << r.stage << ',' << precision_name(r.precision) << ',' << r.shape.M << ',' << r.shape.N << ','
         << r.shape.K << ',' << r.st.median << ',' << r.st.mean << ',' << r.st.stddev << ','
         << r.st.min << ',' << r.st.max << ',' << r.st.n << ',' << r.gflops_median << ','
         << r.gflops_best << ',' << r.pct_cublas << ',' << r.pct_peak << ',' << r.verified

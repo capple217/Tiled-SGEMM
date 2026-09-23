@@ -4,7 +4,9 @@
 //
 // Three layers:
 //  1. Checker sensitivity: prove the tolerance is tight enough to catch a
-//     realistic bug (one dropped k-term) before trusting any PASS.
+//     realistic bug (one dropped k-term) before trusting any PASS, for both the
+//     FP32 and the TF32 tolerance, and prove TF32 cuBLAS output FAILS the FP32
+//     check (so an accidental tensor-core path can't pass as FP32).
 //  2. Small shapes vs a CPU double-precision reference: odd, prime, degenerate
 //     (M/N/K = 1) and non-multiple-of-every-tile sizes. This is where boundary
 //     bugs live, and a CPU reference makes a failure unambiguous.
@@ -123,8 +125,16 @@ struct Problem {
 // ever passes, the tolerance has become too loose to trust.
 void checker_sensitivity(CublasSgemm& blas) {
   std::printf("checker sensitivity (a dropped k-term must FAIL):\n");
-  const Shape shapes[] = {{256, 256, 256}, {1000, 1500, 2003}, {512, 512, 8192}};
-  for (const Shape& s : shapes) {
+  struct Probe { Shape s; Precision p; };
+  // TF32's tolerance is ~70x looser, so its dropped-term probe uses small K
+  // (host_utils.hpp explains the K limit).
+  const Probe probes[] = {{{256, 256, 256}, Precision::FP32},
+                          {{1000, 1500, 2003}, Precision::FP32},
+                          {{512, 512, 8192}, Precision::FP32},
+                          {{256, 256, 256}, Precision::TF32},
+                          {{512, 512, 64}, Precision::TF32}};
+  for (const Probe& pr : probes) {
+    const Shape& s = pr.s;
     Problem p(s, 77);
     const Case c{1.0f, 0.0f};
     const Reference ref = gpu_reference(blas, s.M, s.N, s.K, c.alpha, p.dA, p.dB, c.beta, p.C0);
@@ -137,12 +147,35 @@ void checker_sensitivity(CublasSgemm& blas) {
     std::vector<float> got(size_t(s.M) * s.N);
     CUDA_CHECK(cudaMemcpy(got.data(), p.dC, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
-    const CheckResult r = compare(got.data(), ref.ref.data(), ref.scale.data(), got.size(), s.K);
+    const CheckResult r =
+        compare(got.data(), ref.ref.data(), ref.scale.data(), got.size(), s.K, pr.p);
     const bool ok = !r.pass;  // we WANT a failure here
     (ok ? g_pass : g_fail)++;
-    std::printf("  [%s] %5dx%5dx%5d  max_err=%.1f eps vs tol %.1f eps -> %s\n",
-                ok ? "PASS" : "FAIL", s.M, s.N, s.K, r.max_err / FLT_EPSILON,
-                r.tol / FLT_EPSILON, ok ? "detected" : "NOT DETECTED (tolerance too loose)");
+    std::printf("  [%s] %s %5dx%5dx%5d  max_err=%.1f eps vs tol %.1f eps -> %s\n",
+                ok ? "PASS" : "FAIL", precision_name(pr.p), s.M, s.N, s.K,
+                r.max_err / FLT_EPSILON, r.tol / FLT_EPSILON,
+                ok ? "detected" : "NOT DETECTED (tolerance too loose)");
+  }
+
+  // TF32 cuBLAS must pass the TF32 check and FAIL the FP32 check.
+  std::printf("tf32 cuBLAS vs FP32 reference (TF32 check must pass, FP32 check must fail):\n");
+  CublasSgemm blas_tf32(CublasMath::TF32);
+  for (const Shape s : {Shape{512, 512, 512}, Shape{1024, 1024, 4096}}) {
+    Problem p(s, 91);
+    const Reference ref = gpu_reference(blas, s.M, s.N, s.K, 1.0f, p.dA, p.dB, 0.0f, p.C0);
+    p.reset_C(0.0f);
+    blas_tf32(s.M, s.N, s.K, 1.0f, p.dA, p.dB, 0.0f, p.dC, nullptr);
+    std::vector<float> got(size_t(s.M) * s.N);
+    CUDA_CHECK(cudaMemcpy(got.data(), p.dC, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    const CheckResult rt = compare(got.data(), ref.ref.data(), ref.scale.data(), got.size(), s.K, Precision::TF32);
+    const CheckResult rf = compare(got.data(), ref.ref.data(), ref.scale.data(), got.size(), s.K);
+    const bool ok = rt.pass && !rf.pass;
+    (ok ? g_pass : g_fail)++;
+    std::printf("  [%s] %5dx%5dx%5d  err=%.1f eps  tf32 tol %.0f -> %s, fp32 tol %.0f -> %s%s\n",
+                ok ? "PASS" : "FAIL", s.M, s.N, s.K, rt.max_err / FLT_EPSILON,
+                rt.tol / FLT_EPSILON, rt.pass ? "pass" : "FAIL", rf.tol / FLT_EPSILON,
+                rf.pass ? "pass" : "fail",
+                rf.pass ? "  (cuBLAS TF32 mode may not have used tensor cores here)" : "");
   }
 }
 
@@ -165,7 +198,7 @@ void cublas_vs_cpu(CublasSgemm& blas) {
 }
 
 void test_kernel(const KernelSpec& k, CublasSgemm& blas, bool quick) {
-  std::printf("%s (stage %d):\n", k.name, k.stage);
+  std::printf("%s (stage %d, %s):\n", k.name, k.stage, precision_name(k.precision));
   const int fail_before = g_fail;
   for (const Shape& s : kSmall) {
     Problem p(s, 11);
@@ -174,7 +207,7 @@ void test_kernel(const KernelSpec& k, CublasSgemm& blas, bool quick) {
       std::vector<float> ref(got.size()), scale(got.size());
       cpu_reference(s.M, s.N, s.K, c.alpha, p.A.data(), p.B.data(), c.beta, p.C0.data(),
                     ref.data(), scale.data());
-      report(k.name, s, c, compare(got.data(), ref.data(), scale.data(), got.size(), s.K));
+      report(k.name, s, c, compare(got.data(), ref.data(), scale.data(), got.size(), s.K, k.precision));
     }
   }
   for (const Shape& s : kLarge) {
@@ -183,7 +216,8 @@ void test_kernel(const KernelSpec& k, CublasSgemm& blas, bool quick) {
     for (const Case& c : kCases) {
       const Reference ref = gpu_reference(blas, s.M, s.N, s.K, c.alpha, p.dA, p.dB, c.beta, p.C0);
       const std::vector<float> got = p.run(k.launch, c);
-      report(k.name, s, c, compare(got.data(), ref.ref.data(), ref.scale.data(), got.size(), s.K));
+      report(k.name, s, c,
+             compare(got.data(), ref.ref.data(), ref.scale.data(), got.size(), s.K, k.precision));
     }
   }
   std::printf("  -> %s\n", g_fail == fail_before ? "all passed" : "FAILURES");

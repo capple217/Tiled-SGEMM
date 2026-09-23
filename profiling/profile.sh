@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Profile one kernel at one size with Nsight Compute.
 #
-#   profiling/profile.sh <kernel|cublas> [size=4096]
+#   profiling/profile.sh <kernel|cublas|cublas_tf32> [size=4096]
 #
 # Writes to profiling/reports/:
 #   <kernel>_<size>.ncu-rep        full report (--set full, source-correlated).
@@ -33,7 +33,7 @@ mkdir -p "$OUT"
 # Our kernels are named sgemm_0N_*. (A looser 'sgemm_[0-9]' would also match cuBLAS
 # names like ampere_sgemm_128x64_nn.) cuBLAS kernels contain "gemm". Profile every
 # matching launch (cuBLAS may split into gemm + reduction kernels).
-if [[ $KERNEL == cublas ]]; then FILTER='regex:gemm'; COUNT=4; else FILTER='regex:sgemm_0[0-9]_'; COUNT=1; fi
+if [[ $KERNEL == cublas* ]]; then FILTER='regex:gemm'; COUNT=4; else FILTER='regex:sgemm_0[0-9]_'; COUNT=1; fi
 
 BENCH=("$BUILD/sgemm_bench" --profile --kernel "$KERNEL" --sizes "$SIZE")
 METRICS=$(grep -v '^\s*#' "$ROOT/profiling/metrics.txt" | grep -v '^\s*$' | paste -sd, -)

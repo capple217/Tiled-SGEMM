@@ -20,6 +20,12 @@ struct DeviceInfo {
   // Pass the LOCKED clock for reportable runs; the boost clock is what the
   // spec sheet uses (A100: 108 * 64 * 2 * 1.410 GHz = 19.5 TFLOPS).
   double peak_fp32_gflops(int sm_clock_mhz) const;
+  // Peak dense TF32 tensor-core throughput at a given clock, or 0 if unknown.
+  // Per-SM rate is SKU-dependent (see device_info.cu); tf32_source says which
+  // rule was used so the CSV records it. Override with --tf32-flop-per-clk-sm.
+  int tf32_flop_per_clk_sm = 0;
+  std::string tf32_source;
+  double peak_tf32_gflops(int sm_clock_mhz) const;
   // Peak DRAM = 2 (DDR) * mem clock * bus width / 8. (A100-40GB: ~1555 GB/s.)
   double peak_dram_gbs() const;
 };

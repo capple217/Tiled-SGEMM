@@ -18,8 +18,8 @@ cuobjdump -sass -arch "$ARCH" "$LIB" | awk -v pat="$PAT" '
   keep {
     for (i = 1; i <= NF; i++) {
       op = $i; sub(/[;].*/, "", op)
-      if (op ~ /^(FFMA|LDS|LDS\.[0-9A-Z.]+|STS|STS\.[0-9A-Z.]+|LDG\.[0-9A-Z.]+|STG\.[0-9A-Z.]+|BAR\.SYNC.*)$/) cnt[name, op]++
-      if (op ~ /^(FFMA|LDS|LDS\..*|STS|STS\..*|LDG\..*|STG\..*|BAR\..*)$/) break
+      if (op ~ /^(FFMA|HMMA\.[0-9A-Z.]+|LDS|LDS\.[0-9A-Z.]+|STS|STS\.[0-9A-Z.]+|LDG\.[0-9A-Z.]+|STG\.[0-9A-Z.]+|BAR\.SYNC.*)$/) cnt[name, op]++
+      if (op ~ /^(FFMA|HMMA\..*|LDS|LDS\..*|STS|STS\..*|LDG\..*|STG\..*|BAR\..*)$/) break
     }
   }
   END { for (k in cnt) { split(k, p, SUBSEP); printf "%-70s %-16s %5d\n", p[1], p[2], cnt[k] } }' | sort

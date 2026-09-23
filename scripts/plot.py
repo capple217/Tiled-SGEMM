@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Plots + README table from sgemm_bench CSVs.
+"""Plots + README tables from sgemm_bench CSVs.
 
     python3 scripts/plot.py results/<run>.csv [more.csv ...] [--size 4096] [--out results]
 
-Produces
-  <out>/plots/gflops_vs_size.png        square sweep, one line per kernel + cuBLAS
-  <out>/plots/stage_progression_<N>.png GFLOPS per stage at N^3 with % of cuBLAS
-  <out>/results_table.md                markdown table for README/WRITEUP
+Produces, separately for each arithmetic (fp32 = CUDA cores, tf32 = tensor cores;
+they are never drawn on the same axes, because a TF32 kernel over an FP32
+baseline is not a fair comparison):
+  <out>/plots/gflops_vs_size[_tf32].png        square sweep, one line per kernel + its cuBLAS
+  <out>/plots/stage_progression[_tf32]_<N>.png GFLOPS per stage at N^3 with % of cuBLAS
+  <out>/results_table.md                       markdown tables for README/WRITEUP
 
 Rows with verified == 0 are dropped with a warning: a wrong kernel has no speed.
 If several CSVs contain the same (kernel, M, N, K), the later file wins, so
@@ -28,6 +30,7 @@ STAGE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
                 "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 CUBLAS_COLOR = "#6b6a63"  # neutral: the reference, not a competitor series
 INK, INK_2, GRID = "#1a1a19", "#5c5b55", "#e4e3dc"
+SUFFIX = {"fp32": "", "tf32": "_tf32"}
 
 
 def read_meta(path):
@@ -46,7 +49,8 @@ def load(paths):
     for p in paths:
         meta = read_meta(p) or meta
         df = pd.read_csv(p, comment="#")
-        df["source"] = str(p)
+        if "precision" not in df.columns:  # CSVs from before stage 9
+            df["precision"] = "fp32"
         frames.append(df)
     df = pd.concat(frames, ignore_index=True)
     df = df.drop_duplicates(subset=["kernel", "M", "N", "K"], keep="last")
@@ -58,7 +62,13 @@ def load(paths):
 
 
 def color_for(kernel, stage):
-    return CUBLAS_COLOR if kernel == "cublas" else STAGE_COLORS[(int(stage) - 1) % len(STAGE_COLORS)]
+    if kernel.startswith("cublas"):
+        return CUBLAS_COLOR
+    return STAGE_COLORS[min(int(stage), len(STAGE_COLORS)) - 1]  # stage 9 -> last slot
+
+
+def label_for(kernel, stage):
+    return kernel if kernel.startswith("cublas") else f"{int(stage)}. {kernel}"
 
 
 def style(ax):
@@ -71,88 +81,91 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def title_suffix(meta):
+def title_suffix(meta, prec):
     clk = meta.get("peak_clock_mhz", "?")
-    src = meta.get("peak_clock_source", "")
-    locked = "locked" if src == "user_locked" else "UNLOCKED (boost)"
-    return f"{meta.get('device', '?')} @ {clk} MHz {locked}, cuBLAS {meta.get('cublas_math', '?')}"
+    locked = "locked" if meta.get("peak_clock_source") == "user_locked" else "UNLOCKED (boost)"
+    base = "cuBLAS TF32 tensor-op" if prec == "tf32" else f"cuBLAS {meta.get('cublas_math', '?')}"
+    return f"{meta.get('device', '?')} @ {clk} MHz {locked}, {base}"
 
 
-def plot_vs_size(df, meta, out):
-    sq = df[(df.M == df.N) & (df.N == df.K)]
+def plot_vs_size(df, meta, out, prec):
+    sq = df[(df.M == df.N) & (df.N == df.K) & (df.precision == prec)]
     if sq.empty:
         return
     fig, ax = plt.subplots(figsize=(8, 4.8))
-    kernels = sq.sort_values("stage")[["kernel", "stage"]].drop_duplicates()
-    for _, r in kernels.iterrows():
+    for _, r in sq.sort_values("stage")[["kernel", "stage"]].drop_duplicates().iterrows():
         d = sq[sq.kernel == r.kernel].sort_values("M")
         ax.plot(d.M, d.gflops_median, color=color_for(r.kernel, r.stage), linewidth=2,
-                marker="o", markersize=5, linestyle="--" if r.kernel == "cublas" else "-",
-                label=r.kernel if r.kernel == "cublas" else f"{int(r.stage)}. {r.kernel}")
-    peak = float(meta.get("peak_fp32_gflops", 0) or 0)
+                marker="o", markersize=5,
+                linestyle="--" if r.kernel.startswith("cublas") else "-",
+                label=label_for(r.kernel, r.stage))
+    peak = float(meta.get(f"peak_{prec}_gflops", 0) or 0)
     if peak > 0:
         ax.axhline(peak, color=INK_2, linewidth=1, linestyle=":")
-        ax.annotate(f"FP32 peak {peak / 1000:.1f} TFLOP/s", (sq.M.min(), peak),
+        ax.annotate(f"{prec.upper()} peak {peak / 1000:.1f} TFLOP/s", (sq.M.min(), peak),
                     textcoords="offset points", xytext=(2, 4), color=INK_2, fontsize=8)
     ax.set_xscale("log", base=2)
-    ax.set_xticks(sorted(sq.M.unique()))
-    ax.set_xticklabels([str(v) for v in sorted(sq.M.unique())])
+    ticks = sorted(sq.M.unique())
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([str(v) for v in ticks])
     ax.set_xlabel("M = N = K", color=INK)
     ax.set_ylabel("GFLOP/s (median)", color=INK)
-    ax.set_title(f"SGEMM throughput vs size\n{title_suffix(meta)}", color=INK, fontsize=10, loc="left")
+    ax.set_title(f"SGEMM throughput vs size ({prec.upper()})\n{title_suffix(meta, prec)}",
+                 color=INK, fontsize=10, loc="left")
     style(ax)
     ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.0, 1.0))
     fig.tight_layout()
-    fig.savefig(out / "gflops_vs_size.png", dpi=160)
+    fig.savefig(out / f"gflops_vs_size{SUFFIX[prec]}.png", dpi=160)
     plt.close(fig)
 
 
-def plot_progression(df, meta, out, n):
-    d = df[(df.M == n) & (df.N == n) & (df.K == n)].sort_values("stage")
+def plot_progression(df, meta, out, n, prec):
+    d = df[(df.M == n) & (df.N == n) & (df.K == n) & (df.precision == prec)].sort_values("stage")
     if d.empty:
-        print(f"no rows at {n}^3; skipping progression plot", file=sys.stderr)
         return
     # cuBLAS last so it sits at the bottom as the reference bar.
-    d = pd.concat([d[d.kernel != "cublas"], d[d.kernel == "cublas"]])
-    labels = [k if k == "cublas" else f"{int(s)}. {k}" for k, s in zip(d.kernel, d.stage)]
+    d = pd.concat([d[~d.kernel.str.startswith("cublas")], d[d.kernel.str.startswith("cublas")]])
     fig, ax = plt.subplots(figsize=(8, 0.5 * len(d) + 1.4))
-    y = range(len(d))[::-1]
-    ax.barh(list(y), d.gflops_median, color=[color_for(k, s) for k, s in zip(d.kernel, d.stage)],
+    y = list(range(len(d)))[::-1]
+    ax.barh(y, d.gflops_median, color=[color_for(k, s) for k, s in zip(d.kernel, d.stage)],
             height=0.6, edgecolor="white", linewidth=2)
-    ax.set_yticks(list(y))
-    ax.set_yticklabels(labels, color=INK)
+    ax.set_yticks(y)
+    ax.set_yticklabels([label_for(k, s) for k, s in zip(d.kernel, d.stage)], color=INK)
     xmax = d.gflops_median.max()
     for yi, (_, r) in zip(y, d.iterrows()):
         txt = f"{r.gflops_median:,.0f}"
-        if r.kernel != "cublas":
+        if not r.kernel.startswith("cublas"):
             txt += f"  ({r.pct_cublas:.1f}% of cuBLAS)"
         ax.text(r.gflops_median + xmax * 0.01, yi, txt, va="center", fontsize=8, color=INK_2)
     ax.set_xlim(0, xmax * 1.35)
     ax.set_xlabel("GFLOP/s (median)", color=INK)
-    ax.set_title(f"Optimization progression at {n}x{n}x{n}\n{title_suffix(meta)}",
+    ax.set_title(f"Optimization progression at {n}x{n}x{n} ({prec.upper()})\n{title_suffix(meta, prec)}",
                  color=INK, fontsize=10, loc="left")
     style(ax)
     ax.grid(axis="y", visible=False)
     fig.tight_layout()
-    fig.savefig(out / f"stage_progression_{n}.png", dpi=160)
+    fig.savefig(out / f"stage_progression{SUFFIX[prec]}_{n}.png", dpi=160)
     plt.close(fig)
 
 
-def table(df, meta, out, n):
-    d = df[(df.M == n) & (df.N == n) & (df.K == n)].sort_values("stage")
-    lines = [f"Results at {n}x{n}x{n}. {title_suffix(meta)}, "
-             f"flush_l2={meta.get('flush_l2', '?')}, iters={meta.get('iters', '?')}, git {meta.get('git_rev', '?')}.",
-             "",
-             "| Stage | Kernel | GFLOP/s (median) | ± std | % cuBLAS | % FP32 peak | max err (eps) |",
-             "|---:|---|---:|---:|---:|---:|---:|"]
-    for _, r in d.iterrows():
-        std_gf = r.gflops_median * (r.ms_std / r.ms_median) if r.ms_median > 0 else 0
-        pc = "—" if r.kernel == "cublas" else f"{r.pct_cublas:.1f}%"
-        err = "ref" if r.kernel == "cublas" else f"{r.max_err_eps:.1f}"
-        lines.append(f"| {int(r.stage)} | {r.kernel} | {r.gflops_median:,.0f} | {std_gf:,.0f} | {pc} | "
-                     f"{r.pct_peak:.1f}% | {err} |")
-    (out / "results_table.md").write_text("\n".join(lines) + "\n")
-    print("\n".join(lines))
+def table(df, meta, n):
+    lines = [f"Results at {n}x{n}x{n}. flush_l2={meta.get('flush_l2', '?')}, "
+             f"iters={meta.get('iters', '?')}, git {meta.get('git_rev', '?')}."]
+    for prec in ("fp32", "tf32"):
+        d = df[(df.M == n) & (df.N == n) & (df.K == n) & (df.precision == prec)].sort_values("stage")
+        if d.empty:
+            continue
+        lines += ["", f"**{prec.upper()}**: {title_suffix(meta, prec)}", "",
+                  "| Stage | Kernel | GFLOP/s (median) | ± std | % cuBLAS | % peak | max err (eps) |",
+                  "|---:|---|---:|---:|---:|---:|---:|"]
+        for _, r in d.iterrows():
+            std_gf = r.gflops_median * (r.ms_std / r.ms_median) if r.ms_median > 0 else 0
+            is_ref = r.kernel == "cublas"
+            pc = "—" if r.kernel.startswith("cublas") else f"{r.pct_cublas:.1f}%"
+            err = "ref" if is_ref else f"{r.max_err_eps:.1f}"
+            lines.append(f"| {int(r.stage)} | {r.kernel} | {r.gflops_median:,.0f} | {std_gf:,.0f} | "
+                         f"{pc} | {r.pct_peak:.1f}% | {err} |")
+    return "\n".join(lines) + "\n"
 
 
 def main():
@@ -163,9 +176,12 @@ def main():
     a = ap.parse_args()
     (a.out / "plots").mkdir(parents=True, exist_ok=True)
     df, meta = load(a.csv)
-    plot_vs_size(df, meta, a.out / "plots")
-    plot_progression(df, meta, a.out / "plots", a.size)
-    table(df, meta, a.out, a.size)
+    for prec in ("fp32", "tf32"):
+        plot_vs_size(df, meta, a.out / "plots", prec)
+        plot_progression(df, meta, a.out / "plots", a.size, prec)
+    text = table(df, meta, a.size)
+    (a.out / "results_table.md").write_text(text)
+    print(text)
 
 
 if __name__ == "__main__":

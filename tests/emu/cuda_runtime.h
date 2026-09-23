@@ -14,9 +14,11 @@
 #include <atomic>
 #include <barrier>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <thread>
+#include <algorithm>
 #include <vector>
 
 struct dim3 {
@@ -42,6 +44,9 @@ inline const char* cudaGetErrorString(cudaError_t) { return "no error"; }
 
 namespace emu {
 inline thread_local dim3 tl_threadIdx, tl_blockIdx;
+inline thread_local unsigned tl_linear = 0;  // linear thread id within the block
+// One barrier per warp (32 consecutive linear ids) for __syncwarp.
+inline std::vector<std::barrier<>*> g_warp_barriers;
 inline dim3 g_blockDim, g_gridDim;
 inline std::barrier<>* g_barrier = nullptr;
 inline std::atomic<int> g_exited{0};
@@ -65,10 +70,14 @@ inline void launch(dim3 grid, dim3 block, const std::function<void()>& body) {
   for (unsigned t = 0; t < nt; ++t) {
     ts.emplace_back([&, t] {
       tl_threadIdx = dim3(t % block.x, (t / block.x) % block.y, t / (block.x * block.y));
+      tl_linear = t;
       for (unsigned b = 0; b < nblocks; ++b) {
-        if (t == 0) {  // fresh per-block barrier, since early exits drop from it
+        if (t == 0) {  // fresh per-block barriers, since early exits drop from them
           g_barrier = new std::barrier<>(nt);
           g_exited = 0;
+          g_warp_barriers.clear();
+          for (unsigned w = 0; w < (nt + 31) / 32; ++w)
+            g_warp_barriers.push_back(new std::barrier<>(std::min(32u, nt - 32 * w)));
         }
         phase.arrive_and_wait();  // everyone sees the new barrier
         tl_blockIdx = dim3(b % grid.x, (b / grid.x) % grid.y, b / (grid.x * grid.y));
@@ -78,8 +87,13 @@ inline void launch(dim3 grid, dim3 block, const std::function<void()>& body) {
         // the exit so __syncthreads can flag the divergence.
         ++g_exited;
         g_barrier->arrive_and_drop();
+        g_warp_barriers[t / 32]->arrive_and_drop();
         phase.arrive_and_wait();  // block finished everywhere
-        if (t == 0) delete g_barrier;
+        if (t == 0) {
+          delete g_barrier;
+          for (auto* w : g_warp_barriers) delete w;
+          g_warp_barriers.clear();
+        }
       }
     });
   }
@@ -91,6 +105,9 @@ inline void launch(dim3 grid, dim3 block, const std::function<void()>& body) {
 #define blockIdx (::emu::tl_blockIdx)
 #define blockDim (::emu::g_blockDim)
 #define gridDim (::emu::g_gridDim)
+inline void __syncwarp(unsigned /*mask*/ = 0xffffffffu) {
+  ::emu::g_warp_barriers[::emu::tl_linear / 32]->arrive_and_wait();
+}
 inline void __syncthreads() {
   if (::emu::g_exited.load() > 0) ::emu::g_divergent_barrier = true;
   ::emu::g_barrier->arrive_and_wait();

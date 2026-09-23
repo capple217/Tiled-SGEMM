@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "sgemm/precision.hpp"
+
 namespace sgemm {
 
 // ---------------------------------------------------------------------------
@@ -79,26 +81,45 @@ inline void cpu_reference(int M, int N, int K, float alpha, const float* A,
 // ---------------------------------------------------------------------------
 // Correctness criterion:   |got - ref| / s_ij  <=  tol(K)
 //
-//   tol(K) = eps32 * (4*sqrt(K) + 8)
+//   tol(K) = eps32 * (16 + sqrt(K) / 2)
 //
-// Where the constants come from, for zero-mean uniform inputs:
+// Where it comes from, for zero-mean uniform inputs:
 //  * A sequential FP32 dot product of length K rounds each partial sum s_k.
 //    For zero-mean terms |s_k| ~ sqrt(k)*sigma, so the accumulated error has
 //    std ~ eps*sigma*sqrt(sum_k k) ~ eps*sigma*K/sqrt(6), while s_ij ~ K*E|ab|.
-//    The ratio is ~0.5 eps, independent of K (the worst-case gamma_K ~ K*eps
-//    bound is far too pessimistic here). The max over ~10^7 outputs is a few eps.
-//  * The reference itself may be cuBLAS-in-FP32, so errors from both sides add.
-//  * The alpha scale and beta*C add each contribute <= 1 eps: hence the +8.
-//  * 4*sqrt(K) is headroom for summation orders that correlate error
-//    (e.g. a long serial chain inside one thread), while staying far below
-//    what a real bug produces: dropping one k-term gives normalised error
-//    ~|a b| / s_ij ~ 4/K, i.e. ~1e-3 at K=4096 vs tol ~3e-5.
-//    tests/test_correctness.cu verifies that sensitivity directly.
+//    The ratio is ~0.5 eps, INDEPENDENT of K (the worst-case gamma_K ~ K*eps
+//    bound is far too pessimistic here). tests/test_host.cpp measures ~1-2 eps
+//    at every K from 5 to 16384. On a GPU the max over ~10^7 outputs, plus the
+//    FP32 reference's own error, should stay under ~6 eps.
+//  * 16 eps is that plus >2x margin; sqrt(K)/2 is mild headroom for summation
+//    orders that correlate error. It has to stay TIGHT for two reasons, both
+//    asserted in tests:
+//      - a dropped k-term (normalised ~4/K, ~1e-3 at K=4096) must fail;
+//      - a result computed in TF32 (normalised error ~1e-5 at K=4096) must FAIL
+//        the FP32 check (tested up to K = 8192, where the margin is ~1.8x; beyond
+//        that TF32 error shrinks like 1/sqrt(K) and detection fades), so an
+//        accidental tensor-core path (e.g.
+//        cuBLAS picking TF32) can't pass silently. An earlier version used
+//        4*sqrt(K)*eps and failed this at K >= 4096; the tests caught it.
 // The max normalised error is always reported in units of eps, so the margin
 // is visible rather than hidden behind a pass/fail bit.
-// ---------------------------------------------------------------------------
 inline double tolerance(int K) {
-  return static_cast<double>(FLT_EPSILON) * (4.0 * std::sqrt(static_cast<double>(K)) + 8.0);
+  return static_cast<double>(FLT_EPSILON) * (16.0 + 0.5 * std::sqrt(static_cast<double>(K)));
+}
+
+// TF32 (tensor cores): inputs are rounded to 10 explicit mantissa bits before
+// the multiply, accumulation stays FP32. Input rounding is the dominant error
+// and it has a RIGOROUS bound: if each operand carries relative error <= r, each
+// product carries <= (1+r)^2 - 1 ~ 2r, so |sum of product errors| <= 2r * s_ij.
+//   round-to-nearest (what __float_to_tf32 does): r = 2^-11  -> 2^-10
+//   truncation (possible if an implementation skips the conversion): r = 2^-10 -> 2^-9
+// We budget for truncation (2^-9 ~ 1.95e-3), plus the FP32 accumulation term.
+// Cost of this honesty: the check is ~70x looser than FP32's, so a single
+// dropped k-term (normalised size ~4/K) is only detectable for K below ~2000.
+// test_correctness.cu's TF32 sensitivity check therefore uses K = 256.
+inline double tolerance(int K, Precision p) {
+  const double tf32_inputs = (p == Precision::TF32) ? std::ldexp(1.0, -9) : 0.0;
+  return tf32_inputs + tolerance(K);
 }
 
 struct CheckResult {
@@ -111,9 +132,9 @@ struct CheckResult {
 };
 
 inline CheckResult compare(const float* got, const float* ref, const float* scale,
-                           size_t n, int K) {
+                           size_t n, int K, Precision prec = Precision::FP32) {
   CheckResult r;
-  r.tol = tolerance(K);
+  r.tol = tolerance(K, prec);
   for (size_t i = 0; i < n; ++i) {
     const double err = std::fabs(static_cast<double>(got[i]) - ref[i]) /
                        (static_cast<double>(scale[i]) + static_cast<double>(FLT_MIN));
